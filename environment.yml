@@ -1,0 +1,16 @@
+name: vfss
+channels:
+  - defaults
+dependencies:
+  - numpy
+  - ipykernel
+  - pandas
+  - plotly
+  - nbformat
+  - scikit-learn
+  - openpyxl
+  - black
+  - jinja2
+  - conda-forge::pytorch-lightning
+  - conda-forge::torchvision
+prefix: /Users/caioseda/opt/miniconda3/envs/vfss
