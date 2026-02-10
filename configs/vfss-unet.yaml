@@ -1,0 +1,52 @@
+model:
+  target: src.models.unet.UNet
+  params:
+    n_channels: 3
+    n_classes: 2
+    bilinear: True
+    # steps: 1000
+
+optimizer:
+  target: torch.optim.Adam
+  params:
+    lr: 1e-3
+  
+trainer:
+  target: src.trainers.base.TrainerFromConfig
+  params:
+    max_epochs: 100
+    accelerator: auto
+    devices: auto
+    check_val_every_n_epoch: 2
+    accumulate_grad_batches: 1
+    # callbacks:
+    #   - target: src.callbacks.early_stopping.EarlyStoppingFromConfig
+    #     params:
+    #       monitor: val_loss
+    #       patience: 10
+    #       mode: min
+    #   - target: src.callbacks.model_checkpoint.ModelCheckpointFromConfig
+    #     params:
+    #       monitor: val_loss
+    #       mode: min
+    #       save_top_k: 1
+    #       filename: best_model
+
+data:
+  target: src.data.base.DataModuleFromConfig
+  params:
+    batch_size: 8
+    num_workers: 8
+    wrap: False
+    train:
+      target: src.data.vfss.VFSSTrain
+      params:
+        size: 256
+    validation:
+      target: src.data.vfss.VFSSVal
+      params:
+        size: 256
+    test:
+      target: src.data.vfss.VFSSTest
+      params:
+        size: 256
