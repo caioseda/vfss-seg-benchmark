@@ -11,28 +11,29 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.utils import instantiate_from_config
 from src.models import LitWrapper, UNet
+from src.callbacks import PrintDeviceCallback
+from pytorch_lightning.loggers import TensorBoardLogger
 
 if __name__ == "__main__":
-    base_cfg_path = 'configs/vfss-unet.yaml'
+    base_cfg_path = "configs/vfss-unet.yaml"
     configs = OmegaConf.load(base_cfg_path)
 
+    # Create logger
+    logger = TensorBoardLogger("logs", name="vfss-unet")
+
     # Create model
-    model = LitWrapper(
-        model_cfg=configs.model,
-        optimizer_cfg=configs.optimizer
-    )
-    
+    model = LitWrapper(model_cfg=configs.model, optimizer_cfg=configs.optimizer)
+
     # Create data module
     data_module = instantiate_from_config(configs.data)
 
     trainer = pl.Trainer(
-        accelerator='auto',
-        max_epochs=1000
+        accelerator="auto",
+        logger=logger,
+        max_epochs=1000,
+        callbacks=[PrintDeviceCallback()],
     )
 
     trainer.fit(model, data_module)
     # trainer = pl.Trainer(max_epochs=1000)
     # trainer.fit(lit_model)
-
-
-
