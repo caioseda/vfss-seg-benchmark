@@ -1,6 +1,7 @@
 from torch import nn
 from .modules import *
 
+
 class UNet(nn.Module):
     def __init__(self, n_channels: int, n_classes: int, bilinear: bool = True):
         super().__init__()
@@ -14,10 +15,10 @@ class UNet(nn.Module):
         self.down1 = DownBlock(64, 128)
         self.down2 = DownBlock(128, 256)
         self.down3 = DownBlock(256, 512)
-        self.down4 = DownBlock(512, 1024 // factor) # 512 -> 512
-        self.up1 = UpBlock(1024, 512 // factor, bilinear) # 1024 -> 256
-        self.up2 = UpBlock(512, 256 // factor, bilinear) # 256 -> 128
-        self.up3 = UpBlock(256, 128 // factor, bilinear) # 128 -> 64
+        self.down4 = DownBlock(512, 1024 // factor)  # 512 -> 512
+        self.up1 = UpBlock(1024, 512 // factor, bilinear)  # 1024 -> 256
+        self.up2 = UpBlock(512, 256 // factor, bilinear)  # 256 -> 128
+        self.up3 = UpBlock(256, 128 // factor, bilinear)  # 128 -> 64
         self.up4 = UpBlock(128, 64, bilinear)
         self.out_conv = nn.Conv2d(64, n_classes, kernel_size=1)
 
