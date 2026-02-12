@@ -23,5 +23,7 @@ dependencies:
   - pytorch-lightning
   - torchmetrics
   - conda-forge::tensorboard
+  - conda-forge::mlflow
   - pip:
     - omegaconf
+    - protobuf==3.20.*

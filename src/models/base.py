@@ -58,22 +58,21 @@ class LitWrapper(pl.LightningModule):
         y = y.long()
         return torch.nn.functional.cross_entropy(y_logits, y)
 
-    def calculate_loss_and_metrics(self, y_logits, y):
+    def calculate_loss_and_metrics(self, y_logits, y, stage):
         loss = self.compute_loss(y_logits, y)
         metrics_dict = self.compute_metrics(y_logits, y)
 
         # Create a dictionary to log losses and metrics
-        stage = "train" if self.training else "val"
         loss_dict = {f"{stage}/loss": loss}
         for metric_name, metric_value in metrics_dict.items():
             loss_dict[f"{stage}/{metric_name}"] = metric_value
 
         return loss, loss_dict
 
-    def shared_step(self, batch, batch_idx):
+    def shared_step(self, batch, batch_idx, stage):
         x, y = batch["image"], batch["segmentation"]
         y_pred = self.forward(x)
-        loss, loss_dict = self.calculate_loss_and_metrics(y_pred, y)
+        loss, loss_dict = self.calculate_loss_and_metrics(y_pred, y, stage)
 
         self.log(
             "step",
@@ -90,19 +89,19 @@ class LitWrapper(pl.LightningModule):
         return loss, loss_dict, y_pred, y
 
     def training_step(self, batch, batch_idx):
-        loss, *_ = self.shared_step(batch, batch_idx)
+        loss, *_ = self.shared_step(batch, batch_idx, stage="train")
         return loss
 
     def validation_step(self, batch, batch_idx):
-        loss, *_ = self.shared_step(batch, batch_idx)
+        loss, *_ = self.shared_step(batch, batch_idx, stage="val")
         return loss
 
     def test_step(self, batch, batch_idx):
-        loss, *_ = self.shared_step(batch, batch_idx)
+        loss, *_ = self.shared_step(batch, batch_idx, stage="test")
         return loss
 
     def predict_step(self, batch, batch_idx):
-        *_, y_pred, y = self.shared_step(batch, batch_idx)
+        *_, y_pred, y = self.shared_step(batch, batch_idx, stage="predict")
         return y_pred, y
 
     def configure_optimizers(self):

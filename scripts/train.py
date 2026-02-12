@@ -1,4 +1,5 @@
 import pytorch_lightning as pl
+import torch
 from omegaconf import DictConfig, ListConfig, OmegaConf
 from datetime import datetime
 
@@ -16,6 +17,27 @@ from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger, MLFlowLogger
 
 pl.seed_everything(42)
 
+
+def _to_scalar(value):
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 1:
+            return value.detach().cpu().item()
+        return value.detach().cpu().mean().item()
+    return value
+
+
+def _print_metric_block(title, metrics):
+    print(f"\n{title}")
+    if not metrics:
+        print("  (no metrics found)")
+        return
+
+    for name in sorted(metrics):
+        value = _to_scalar(metrics[name])
+        if isinstance(value, float):
+            print(f"  {name}: {value:.6f}")
+        else:
+            print(f"  {name}: {value}")
 
 if __name__ == "__main__":
 
@@ -54,5 +76,18 @@ if __name__ == "__main__":
     )
 
     trainer.fit(model, data_module)
+
+    fit_metrics = {
+        k: v
+        for k, v in trainer.callback_metrics.items()
+        if k.startswith("train/") or k.startswith("val/")
+    }
+
+    test_results = trainer.test(model=model, datamodule=data_module)
+    test_metrics = test_results[0] if test_results else {}
+
+    _print_metric_block("Final train/validation metrics", fit_metrics)
+    _print_metric_block("Final test metrics", test_metrics)
+
     # trainer = pl.Trainer(max_epochs=1000)
     # trainer.fit(lit_model)
