@@ -40,8 +40,7 @@ def _print_metric_block(title, metrics):
             print(f"  {name}: {value}")
 
 if __name__ == "__main__":
-
-    base_cfg_path = "configs/vfss-unet.yaml"
+    base_cfg_path = 'configs/vfss-inca-unet.yaml'
     configs = OmegaConf.load(base_cfg_path)
     experiment_name = configs.get("experiment_name", "vfss-unet")
     run_timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M")

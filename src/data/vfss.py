@@ -5,8 +5,7 @@ from torchvision import transforms
 from vfss_data_split.datasets.vfss_dataset import VFSSImageDataset
 import vfss_data_split.data_extraction.video_frame as video_frame
 
-
-class VFSSDatasetBase(VFSSImageDataset):
+class VFSSIncaDatasetBase(VFSSImageDataset):
     """VFSS Dataset Base for ldm.data"""
 
     def __init__(self, data_root, size=256, num_classes=2, **kwargs):
@@ -82,8 +81,7 @@ class VFSSDatasetBase(VFSSImageDataset):
         )
         return example
 
-
-class VFSSTrain(VFSSDatasetBase):
+class VFSSIncaTrain(VFSSIncaDatasetBase):
     def __init__(self, **kwargs):
         super().__init__(
             f"../dados_inca/metadados/video_frame_metadata_train.csv",
@@ -94,12 +92,22 @@ class VFSSTrain(VFSSDatasetBase):
             **kwargs,
         )
 
-
-class VFSSVal(VFSSDatasetBase):
+class VFSSIncaVal(VFSSIncaDatasetBase):
     def __init__(self, **kwargs):
         super().__init__(
-            f"../dados_inca/metadados/video_frame_metadata_val.csv",
-            target="mask",
+            f'../dados_inca/metadados/video_frame_metadata_val.csv',
+            target='mask',
+            from_images=True,
+            return_single_target=True, 
+            return_metadata=False,
+            **kwargs
+        )
+    
+class VFSSIncaTest(VFSSIncaDatasetBase):
+    def __init__(self, **kwargs):
+        super().__init__(
+            f'../dados_inca/metadados/video_frame_metadata_test.csv',
+            target='mask',
             from_images=True,
             return_single_target=True,
             return_metadata=False,
@@ -120,4 +128,4 @@ class VFSSTest(VFSSDatasetBase):
 
 
 if __name__ == "__main__":
-    print("Testing VFSSDatasetBase...")
+    print("Testing VFSSIncaDatasetBase...")

@@ -1,4 +1,4 @@
-experiment_name: vfss-unet
+xperiment_name: vfss-unet
 
 model:
   target: src.models.unet.UNet
@@ -36,14 +36,15 @@ data:
     num_workers: 8
     wrap: False
     train:
-      target: src.data.vfss.VFSSTrain
+      target: src.data.vfss.VFSSIncaTrain
       params:
         size: 256
     validation:
-      target: src.data.vfss.VFSSVal
+      target: src.data.vfss.VFSSIncaVal
       params:
         size: 256
     test:
-      target: src.data.vfss.VFSSTest
+      target: src.data.vfss.VFSSIncaTest
       params:
         size: 256
+
