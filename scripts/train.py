@@ -1,5 +1,5 @@
 import pytorch_lightning as pl
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, ListConfig, OmegaConf
 from datetime import datetime
 
 import sys
@@ -11,10 +11,11 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.utils import instantiate_from_config
 from src.models import LitWrapper
-from src.callbacks import PrintDeviceCallback, EarlyStopping
-from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
+from src.callbacks import build_callbacks
+from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger, MLFlowLogger
 
 pl.seed_everything(42)
+
 
 if __name__ == "__main__":
 
@@ -23,9 +24,14 @@ if __name__ == "__main__":
     experiment_name = configs.get("experiment_name", "vfss-unet")
     run_timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M")
 
-    # Create loggers: TensorBoard events + CSV metrics in the same timestamped folder.
+    # Create loggers
     tb_logger = TensorBoardLogger(
         "logs", name=experiment_name, version=run_timestamp
+    )
+    mlflow_logger = MLFlowLogger(
+        experiment_name=experiment_name,
+        tracking_uri="file:./mlruns",
+        run_name=run_timestamp
     )
     csv_logger = CSVLogger(
         "logs", name=experiment_name, version=run_timestamp
@@ -37,10 +43,8 @@ if __name__ == "__main__":
     # Create data module
     data_module = instantiate_from_config(configs.data)
 
-    callbacks = [
-        PrintDeviceCallback(),
-        EarlyStopping(monitor="val/loss", mode="min", patience=5)
-    ]
+    callbacks_cfg = configs.trainer.get("callbacks", [])
+    callbacks = build_callbacks(callbacks_cfg)
 
     trainer_params = configs['trainer']['params']
     trainer = pl.Trainer(

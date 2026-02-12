@@ -6,7 +6,6 @@ model:
     n_channels: 3
     n_classes: 2
     bilinear: True
-    # steps: 1000
 
 optimizer:
   target: torch.optim.Adam
@@ -16,23 +15,19 @@ optimizer:
 trainer:
   target: src.trainers.base.TrainerFromConfig
   params:
-    max_epochs: 10
+    max_epochs: 100
     accelerator: auto
     devices: auto
     check_val_every_n_epoch: 2
     accumulate_grad_batches: 1
-    # callbacks:
-    #   - target: src.callbacks.early_stopping.EarlyStoppingFromConfig
-    #     params:
-    #       monitor: val_loss
-    #       patience: 10
-    #       mode: min
-    #   - target: src.callbacks.model_checkpoint.ModelCheckpointFromConfig
-    #     params:
-    #       monitor: val_loss
-    #       mode: min
-    #       save_top_k: 1
-    #       filename: best_model
+  callbacks:
+    - target: src.callbacks.PrintDeviceCallback
+    - target: src.callbacks.DeviceStatsMonitor
+    # - target: pytorch_lightning.callbacks.EarlyStopping
+    #   params:
+    #     monitor: val/loss
+    #     mode: min
+    #     patience: 10
 
 data:
   target: src.data.base.DataModuleFromConfig
