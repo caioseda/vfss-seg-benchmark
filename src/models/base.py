@@ -1,5 +1,6 @@
 import pytorch_lightning as pl
 import torch
+from omegaconf import DictConfig, OmegaConf
 from torchmetrics.functional.segmentation import mean_iou, dice_score
 from ..utils import instantiate_from_config, get_obj_from_str
 
@@ -7,10 +8,22 @@ from ..utils import instantiate_from_config, get_obj_from_str
 class LitWrapper(pl.LightningModule):
     def __init__(self, model_cfg, optimizer_cfg):
         super().__init__()
+        self.save_hyperparameters(
+            {
+                "model_cfg": self._to_serializable(model_cfg),
+                "optimizer_cfg": self._to_serializable(optimizer_cfg),
+            }
+        )
         self.model_cfg = model_cfg
         self.optimizer_cfg = optimizer_cfg
         self.model = instantiate_from_config(model_cfg)
         self.n_classes = self.model.n_classes
+
+    @staticmethod
+    def _to_serializable(value):
+        if isinstance(value, DictConfig):
+            return OmegaConf.to_container(value, resolve=True)
+        return value
 
     def forward(self, x):
         return self.model(x)
@@ -41,9 +54,9 @@ class LitWrapper(pl.LightningModule):
         return metrics_dict
 
     def compute_loss(self, y_logits, y):
-        y_pred = y_logits.squeeze(1)
+        # y_pred = y_logits.squeeze(1)
         y = y.long()
-        return torch.nn.functional.cross_entropy(y_pred, y)
+        return torch.nn.functional.cross_entropy(y_logits, y)
 
     def calculate_loss_and_metrics(self, y_logits, y):
         loss = self.compute_loss(y_logits, y)
@@ -94,6 +107,8 @@ class LitWrapper(pl.LightningModule):
 
     def configure_optimizers(self):
         optimizer_cls = get_obj_from_str(self.optimizer_cfg["target"])
-        return optimizer_cls(
-            self.model.parameters(), **self.optimizer_cfg.get("params", {})
+        optimizer_params = self.optimizer_cfg.get("params", {})
+        optimizer = optimizer_cls(
+            self.model.parameters(), **optimizer_params
         )
+        return optimizer
