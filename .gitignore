@@ -4,3 +4,6 @@
 
 lightning_logs/
 *fix_paths.ipynb
+
+logs/
+log/
