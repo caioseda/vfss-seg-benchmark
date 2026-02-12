@@ -15,11 +15,13 @@ dependencies:
   - black
   - jinja2
   - matplotlib
+  - setuptools<81
   - pytorch::pytorch==2.4.0
   - pytorch::torchvision==0.19.0
   - pytorch::torchaudio==2.4.0
   - pytorch::pytorch-cuda=12.4
   - pytorch-lightning
   - torchmetrics
+  - conda-forge::tensorboard
   - pip:
     - omegaconf
