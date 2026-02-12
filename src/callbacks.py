@@ -1,5 +1,5 @@
 from pytorch_lightning.callbacks import Callback
-from utils import instantiate_from_config
+from src.utils import instantiate_from_config
 from omegaconf import DictConfig, ListConfig, OmegaConf
 
 def build_callbacks(callbacks_cfg):
