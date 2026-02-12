@@ -1,181 +1,127 @@
+import copy
+import random
+from typing import Any, Dict, Optional
+
+import numpy as np
 import pytorch_lightning as pl
 import torch
-import numpy as np
-from torch.utils.data import Dataset, DataLoader, IterableDataset
-from abc import abstractmethod
-from functools import partial
+from torch.utils.data import DataLoader
+
 from ..utils import instantiate_from_config
 
 
-class WrappedDataset(Dataset):
-    """Wraps an arbitrary object with __len__ and __getitem__ into a pytorch dataset"""
+class _LenGetItemWrapper:
+    """Wrap objects with __len__/__getitem__ into a plain dataset-like object."""
 
-    def __init__(self, dataset):
-        self.data = dataset
+    def __init__(self, dataset: Any):
+        self.dataset = dataset
 
-    def __len__(self):
-        return len(self.data)
+    def __len__(self) -> int:
+        return len(self.dataset)
 
-    def __getitem__(self, idx):
-        return self.data[idx]
-
-
-class Txt2ImgIterableBaseDataset(IterableDataset):
-    """
-    Define an interface to make the IterableDatasets for text2img data chainable
-    """
-
-    def __init__(self, num_records=0, valid_ids=None, size=256):
-        super().__init__()
-        self.num_records = num_records
-        self.valid_ids = valid_ids
-        self.sample_ids = valid_ids
-        self.size = size
-
-        print(f"{self.__class__.__name__} dataset contains {self.__len__()} examples.")
-
-    def __len__(self):
-        return self.num_records
-
-    @abstractmethod
-    def __iter__(self):
-        pass
+    def __getitem__(self, index: int) -> Any:
+        return self.dataset[index]
 
 
-def worker_init_fn(_):
-    worker_info = torch.utils.data.get_worker_info()
-
-    dataset = worker_info.dataset
-    worker_id = worker_info.id
-
-    if isinstance(dataset, Txt2ImgIterableBaseDataset):
-        split_size = dataset.num_records // worker_info.num_workers
-        # reset num_records to the true number to retain reliable length information
-        dataset.sample_ids = dataset.valid_ids[
-            worker_id * split_size : (worker_id + 1) * split_size
-        ]
-        current_id = np.random.choice(len(np.random.get_state()[1]), 1)
-        return np.random.seed(np.random.get_state()[1][current_id] + worker_id)
-    else:
-        return np.random.seed(np.random.get_state()[1][0] + worker_id)
+def seed_worker(worker_id: int) -> None:
+    """Set deterministic seeds for dataloader workers."""
+    seed = torch.initial_seed() % (2**32)
+    np.random.seed(seed + worker_id)
+    random.seed(seed + worker_id)
 
 
 class DataModuleFromConfig(pl.LightningDataModule):
+    """Simple configurable datamodule for train/val/test/predict datasets."""
+
     def __init__(
         self,
-        batch_size,
-        train=None,
-        validation=None,
-        test=None,
-        predict=None,
-        wrap=False,
-        num_workers=None,
-        shuffle_test_loader=False,
-        use_worker_init_fn=False,
-        shuffle_val_dataloader=False,
+        batch_size: int,
+        train: Optional[Dict[str, Any]] = None,
+        validation: Optional[Dict[str, Any]] = None,
+        test: Optional[Dict[str, Any]] = None,
+        predict: Optional[Dict[str, Any]] = None,
+        num_workers: Optional[int] = None,
+        wrap: bool = False,
+        use_worker_init_fn: bool = False,
+        shuffle_val_dataloader: bool = False,
+        shuffle_test_loader: bool = False,
+        shared_dataset_params: Optional[Dict[str, Any]] = None,
+        base_kwargs: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
+
         self.batch_size = batch_size
-        self.dataset_configs = dict()
         self.num_workers = num_workers if num_workers is not None else batch_size * 2
         self.use_worker_init_fn = use_worker_init_fn
-        if train is not None:
-            self.dataset_configs["train"] = train
-            self.train_dataloader = self._train_dataloader
-        if validation is not None:
-            self.dataset_configs["validation"] = validation
-            self.val_dataloader = partial(
-                self._val_dataloader, shuffle=shuffle_val_dataloader
-            )
-        if test is not None:
-            self.dataset_configs["test"] = test
-            self.test_dataloader = partial(
-                self._test_dataloader, shuffle=shuffle_test_loader
-            )
-        if predict is not None:
-            self.dataset_configs["predict"] = predict
-            self.predict_dataloader = self._predict_dataloader
         self.wrap = wrap
 
-    def prepare_data(self):
-        for data_cfg in self.dataset_configs.values():
-            instantiate_from_config(data_cfg)
+        # Keep backward compatibility with `base_kwargs` while preferring `shared_dataset_params`.
+        self.shared_dataset_params = dict(base_kwargs or {})
+        if shared_dataset_params:
+            self.shared_dataset_params.update(dict(shared_dataset_params))
 
-    def setup(self, stage=None):
-        self.datasets = dict(
-            (k, instantiate_from_config(self.dataset_configs[k]))
-            for k in self.dataset_configs
-        )
+        split_configs = {
+            "train": train,
+            "validation": validation,
+            "test": test,
+            "predict": predict,
+        }
+        self.dataset_configs = {
+            name: self._build_dataset_config(cfg)
+            for name, cfg in split_configs.items()
+            if cfg is not None
+        }
+
+        self._shuffle_val = shuffle_val_dataloader
+        self._shuffle_test = shuffle_test_loader
+        self.datasets: Dict[str, Any] = {}
+
+    def _build_dataset_config(self, dataset_cfg: Dict[str, Any]) -> Dict[str, Any]:
+        cfg = copy.deepcopy(dataset_cfg)
+        merged_params = dict(self.shared_dataset_params)
+        merged_params.update(dict(cfg.get("params", {})))
+        cfg["params"] = merged_params
+        return cfg
+
+    def prepare_data(self) -> None:
+        for cfg in self.dataset_configs.values():
+            instantiate_from_config(cfg)
+
+    def setup(self, stage: Optional[str] = None) -> None:
+        # Build all configured datasets once and reuse.
+        if self.datasets:
+            return
+        self.datasets = {
+            name: instantiate_from_config(cfg)
+            for name, cfg in self.dataset_configs.items()
+        }
         if self.wrap:
-            for k in self.datasets:
-                self.datasets[k] = WrappedDataset(self.datasets[k])
+            self.datasets = {
+                name: _LenGetItemWrapper(dataset)
+                for name, dataset in self.datasets.items()
+            }
 
-    def _train_dataloader(self):
-        is_iterable_dataset = isinstance(
-            self.datasets["train"], Txt2ImgIterableBaseDataset
-        )
-        if is_iterable_dataset or self.use_worker_init_fn:
-            init_fn = worker_init_fn
-        else:
-            init_fn = None
+    def _make_loader(self, split: str, shuffle: bool) -> DataLoader:
+        if split not in self.datasets:
+            raise KeyError(f"Split '{split}' was not configured.")
+
         return DataLoader(
-            self.datasets["train"],
+            self.datasets[split],
             batch_size=self.batch_size,
             num_workers=self.num_workers,
-            shuffle=False if is_iterable_dataset else True,
-            worker_init_fn=init_fn,
-            pin_memory=True,
-        )
-
-    def _val_dataloader(self, shuffle=False):
-        if (
-            isinstance(self.datasets["validation"], Txt2ImgIterableBaseDataset)
-            or self.use_worker_init_fn
-        ):
-            init_fn = worker_init_fn
-        else:
-            init_fn = None
-        return DataLoader(
-            self.datasets["validation"],
-            batch_size=self.batch_size,
-            num_workers=self.num_workers,
-            worker_init_fn=init_fn,
             shuffle=shuffle,
             pin_memory=True,
+            worker_init_fn=seed_worker if self.use_worker_init_fn else None,
         )
 
-    def _test_dataloader(self, shuffle=False):
-        is_iterable_dataset = isinstance(
-            self.datasets["train"], Txt2ImgIterableBaseDataset
-        )
-        if is_iterable_dataset or self.use_worker_init_fn:
-            init_fn = worker_init_fn
-        else:
-            init_fn = None
+    def train_dataloader(self) -> DataLoader:
+        return self._make_loader("train", shuffle=True)
 
-        # do not shuffle dataloader for iterable dataset
-        shuffle = shuffle and (not is_iterable_dataset)
+    def val_dataloader(self) -> DataLoader:
+        return self._make_loader("validation", shuffle=self._shuffle_val)
 
-        return DataLoader(
-            self.datasets["test"],
-            batch_size=self.batch_size,
-            num_workers=self.num_workers,
-            worker_init_fn=init_fn,
-            shuffle=shuffle,
-            pin_memory=True,
-        )
+    def test_dataloader(self) -> DataLoader:
+        return self._make_loader("test", shuffle=self._shuffle_test)
 
-    def _predict_dataloader(self, shuffle=False):
-        if (
-            isinstance(self.datasets["predict"], Txt2ImgIterableBaseDataset)
-            or self.use_worker_init_fn
-        ):
-            init_fn = worker_init_fn
-        else:
-            init_fn = None
-        return DataLoader(
-            self.datasets["predict"],
-            batch_size=self.batch_size,
-            num_workers=self.num_workers,
-            worker_init_fn=init_fn,
-        )
+    def predict_dataloader(self) -> DataLoader:
+        return self._make_loader("predict", shuffle=False)

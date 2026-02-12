@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 from torchvision import transforms
+from pathlib import Path
 
 from vfss_data_split.datasets.vfss_dataset import VFSSImageDataset
 import vfss_data_split.data_extraction.video_frame as video_frame
@@ -70,7 +71,6 @@ class VFSSIncaDatasetBase(VFSSImageDataset):
         image = torch.from_numpy(image).permute(2, 0, 1).contiguous()
 
         example["image"] = image
-        example["class_id"] = torch.tensor([-1])  # doesn't matter for binary seg
 
         assert (
             torch.max(example["segmentation"]) <= 1
@@ -82,9 +82,10 @@ class VFSSIncaDatasetBase(VFSSImageDataset):
         return example
 
 class VFSSIncaTrain(VFSSIncaDatasetBase):
-    def __init__(self, **kwargs):
+    def __init__(self, data_root="../dados_inca/metadados", **kwargs):
+        data_root = Path(data_root)
         super().__init__(
-            f"../dados_inca/metadados/video_frame_metadata_train.csv",
+            str(data_root / "video_frame_metadata_train.csv"),
             target="mask",
             from_images=True,
             return_single_target=True,
@@ -93,9 +94,10 @@ class VFSSIncaTrain(VFSSIncaDatasetBase):
         )
 
 class VFSSIncaVal(VFSSIncaDatasetBase):
-    def __init__(self, **kwargs):
+    def __init__(self, data_root="../dados_inca/metadados", **kwargs):
+        data_root = Path(data_root)
         super().__init__(
-            f'../dados_inca/metadados/video_frame_metadata_val.csv',
+            str(data_root / "video_frame_metadata_val.csv"),
             target='mask',
             from_images=True,
             return_single_target=True, 
@@ -104,9 +106,10 @@ class VFSSIncaVal(VFSSIncaDatasetBase):
         )
     
 class VFSSIncaTest(VFSSIncaDatasetBase):
-    def __init__(self, **kwargs):
+    def __init__(self, data_root="../dados_inca/metadados", **kwargs):
+        data_root = Path(data_root)
         super().__init__(
-            f'../dados_inca/metadados/video_frame_metadata_test.csv',
+            str(data_root / "video_frame_metadata_test.csv"),
             target='mask',
             from_images=True,
             return_single_target=True,
@@ -115,7 +118,7 @@ class VFSSIncaTest(VFSSIncaDatasetBase):
         )
 
 
-class VFSSTest(VFSSDatasetBase):
+class VFSSTest(VFSSIncaDatasetBase):
     def __init__(self, **kwargs):
         super().__init__(
             f"../dados_inca/metadados/video_frame_metadata_test.csv",

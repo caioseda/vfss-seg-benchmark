@@ -1,6 +1,5 @@
 import pytorch_lightning as pl
 import torch
-from omegaconf import DictConfig, ListConfig, OmegaConf
 from datetime import datetime
 
 import sys
@@ -13,7 +12,9 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.utils import instantiate_from_config
 from src.models import LitWrapper
 from src.callbacks import build_callbacks
+from src.cli import get_cli_args
 from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger, MLFlowLogger
+from omegaconf import OmegaConf
 
 pl.seed_everything(42)
 
@@ -40,19 +41,15 @@ def _print_metric_block(title, metrics):
             print(f"  {name}: {value}")
 
 if __name__ == "__main__":
-    base_cfg_path = 'configs/vfss-inca-unet.yaml'
-    configs = OmegaConf.load(base_cfg_path)
-    experiment_name = configs.get("experiment_name", "vfss-unet")
+    args = get_cli_args(default_config="configs/vfss-inca-unet.yaml")
+    configs = OmegaConf.load(args.config)
+
+    experiment_name = configs.get("experiment_name", "default_experiment")
     run_timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M")
 
     # Create loggers
     tb_logger = TensorBoardLogger(
         "logs", name=experiment_name, version=run_timestamp
-    )
-    mlflow_logger = MLFlowLogger(
-        experiment_name=experiment_name,
-        tracking_uri="file:./mlruns",
-        run_name=run_timestamp
     )
     csv_logger = CSVLogger(
         "logs", name=experiment_name, version=run_timestamp

@@ -1,4 +1,4 @@
-xperiment_name: vfss-unet
+experiment_name: vfss-unm-unet
 
 model:
   target: src.models.unet.UNet
@@ -40,11 +40,13 @@ data:
     num_workers: 8
     wrap: False
     shared_dataset_params:
-      data_root: ../dados_inca/metadados
+      data_root: /data_ssd/caioseda/data/dataset_unm
       size: 256
+      image_interpolation: bilinear
+      mask_interpolation: nearest
     train:
-      target: src.data.vfss.VFSSIncaTrain
+      target: src.data.unm.VFSSUnmTrain
     validation:
-      target: src.data.vfss.VFSSIncaVal
+      target: src.data.unm.VFSSUnmVal
     test:
-      target: src.data.vfss.VFSSIncaTest
+      target: src.data.unm.VFSSUnmTest
