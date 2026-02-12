@@ -1,3 +1,5 @@
+experiment_name: vfss-unet
+
 model:
   target: src.models.unet.UNet
   params:
@@ -14,7 +16,7 @@ optimizer:
 trainer:
   target: src.trainers.base.TrainerFromConfig
   params:
-    max_epochs: 100
+    max_epochs: 10
     accelerator: auto
     devices: auto
     check_val_every_n_epoch: 2
