@@ -1,4 +1,3 @@
-import argparse
 import sys
 from pathlib import Path
 from typing import List
@@ -10,29 +9,12 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.runner import run_experiment
-
-
-def _parse_args():
-    parser = argparse.ArgumentParser(
-        description="Run multiple experiments from a benchmark YAML."
-    )
-    parser.add_argument(
-        "--benchmark-config",
-        type=str,
-        default="configs/benchmark/default.yaml",
-        help="Path to benchmark YAML file.",
-    )
-    return parser.parse_args()
-
-
-def _resolve_benchmark_config(path_str: str) -> Path:
-    path = Path(path_str).expanduser().resolve()
-    if not path.exists():
-        raise FileNotFoundError(f"Benchmark config file not found: {path}")
-    return path
+from src.cli import get_cli_args
+from src.utils import _resolve_config_path
 
 
 def _load_experiment_list(benchmark_cfg_path: Path) -> List[str]:
+    benchmark_cfg_path = benchmark_cfg_path.expanduser().resolve()
     cfg = OmegaConf.load(str(benchmark_cfg_path))
     experiments = cfg.get("experiments")
     if not isinstance(experiments, (list, ListConfig)) or len(experiments) == 0:
@@ -40,20 +22,23 @@ def _load_experiment_list(benchmark_cfg_path: Path) -> List[str]:
             f"`experiments` must be a non-empty list in {benchmark_cfg_path}"
         )
 
-    resolved = []
+    valid_experiment_cfg = []
     for item in experiments:
         exp_path = Path(str(item)).expanduser()
         if not exp_path.is_absolute():
-            exp_path = (benchmark_cfg_path.parent / exp_path).resolve()
+            exp_path = (PROJECT_ROOT / exp_path).resolve()
         if not exp_path.exists():
             raise FileNotFoundError(f"Experiment config not found: {exp_path}")
-        resolved.append(str(exp_path))
-    return resolved
+        valid_experiment_cfg.append(str(exp_path))
+    return valid_experiment_cfg
 
 
 if __name__ == "__main__":
-    args = _parse_args()
-    benchmark_cfg_path = _resolve_benchmark_config(args.benchmark_config)
+    args = get_cli_args(
+        argparse_description="Run a benchmark of multiple experiments defined in a YAML config.", 
+        default_config="configs/vfss-baseline.yaml"
+    )
+    benchmark_cfg_path = _resolve_config_path(args.benchmark_config)
     benchmark_cfg = OmegaConf.load(str(benchmark_cfg_path))
     benchmark_name = benchmark_cfg.get("benchmark_name", benchmark_cfg_path.stem)
 

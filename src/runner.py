@@ -9,40 +9,10 @@ from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
 
 from src.callbacks import build_callbacks
 from src.models import LitWrapper
-from src.utils import instantiate_from_config
+from src.utils import instantiate_from_config, _to_scalar, _resolve_config_path, _print_metric_block
 
 
 pl.seed_everything(42)
-
-
-def _to_scalar(value: Any) -> Any:
-    if isinstance(value, torch.Tensor):
-        if value.numel() == 1:
-            return value.detach().cpu().item()
-        return value.detach().cpu().mean().item()
-    return value
-
-
-def _print_metric_block(title: str, metrics: Dict[str, Any]) -> None:
-    print(f"\n{title}")
-    if not metrics:
-        print("  (no metrics found)")
-        return
-
-    for name in sorted(metrics):
-        value = _to_scalar(metrics[name])
-        if isinstance(value, float):
-            print(f"  {name}: {value:.6f}")
-        else:
-            print(f"  {name}: {value}")
-
-
-def _resolve_config_path(config_path: str) -> Path:
-    path = Path(config_path).expanduser().resolve()
-    if not path.exists():
-        raise FileNotFoundError(f"Config file not found: {path}")
-    return path
-
 
 def run_experiment(config_path: str, run_suffix: Optional[str] = None) -> Dict[str, Any]:
     cfg_path = _resolve_config_path(config_path)
@@ -52,7 +22,7 @@ def run_experiment(config_path: str, run_suffix: Optional[str] = None) -> Dict[s
     experiment_name = config.get("experiment_name", config_filename)
     run_timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
     run_version = run_timestamp if run_suffix is None else f"{run_timestamp}-{run_suffix}"
-
+    
     print(f"Loaded configuration: {cfg_path}")
     print(f"Run version: {run_version}")
 
