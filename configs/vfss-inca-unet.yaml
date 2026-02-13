@@ -1,4 +1,4 @@
-xperiment_name: vfss-unet
+experiment_name: vfss-unet
 
 model:
   target: src.models.unet.UNet
