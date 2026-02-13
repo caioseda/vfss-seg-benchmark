@@ -1,0 +1,4 @@
+benchmark_name: vfss-baseline
+experiments:
+  - configs/vfss-inca-unet.yaml
+  - configs/vfss-unm-unet.yaml
