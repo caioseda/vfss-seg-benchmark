@@ -1,0 +1,6 @@
+benchmark_name: vfss-transunet
+experiments:
+  - configs/experiment/transunet/vfss-inca-transunet-r50-b16.yaml
+  - configs/experiment/transunet/vfss-unm-transunet-r50-b16.yaml
+  - configs/experiment/transunet/vfss-inca-transunet-b16.yaml
+  - configs/experiment/transunet/vfss-unm-transunet-b16.yaml

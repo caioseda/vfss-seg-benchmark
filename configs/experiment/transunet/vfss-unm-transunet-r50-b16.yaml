@@ -1,0 +1,68 @@
+experiment_name: vfss-unm-transunet-r50-b16
+
+model:
+  target: src.models.transunet.adapters.TransUNet
+  params:
+    n_channels: 3
+    n_classes: 2
+    image_size: 256
+    vis: False
+    vit_config:
+      patches:
+        size: [16, 16]
+        grid: [16, 16]
+      hidden_size: 768
+      transformer:
+        mlp_dim: 3072
+        num_heads: 12
+        num_layers: 12
+        attention_dropout_rate: 0.0
+        dropout_rate: 0.1
+      classifier: seg
+      representation_size: null
+      resnet_pretrained_path: null
+      resnet:
+        num_layers: [3, 4, 9]
+        width_factor: 1
+      pretrained_path: null
+      patch_size: 16
+      decoder_channels: [256, 128, 64, 16]
+      skip_channels: [512, 256, 64, 16]
+      n_classes: 2
+      n_skip: 3
+      activation: softmax
+
+optimizer:
+  target: torch.optim.Adam
+  params:
+    lr: 1e-3
+
+trainer:
+  target: src.trainers.base.TrainerFromConfig
+  params:
+    max_epochs: 100
+    accelerator: auto
+    devices: auto
+    check_val_every_n_epoch: 2
+    accumulate_grad_batches: 1
+  callbacks:
+    - target: src.callbacks.PrintDeviceCallback
+    - target: pytorch_lightning.callbacks.DeviceStatsMonitor
+
+data:
+  target: src.data.base.DataModuleFromConfig
+  params:
+    batch_size: 8
+    num_workers: 8
+    wrap: False
+    shared_dataset_params:
+      data_root: /data_ssd/caioseda/data/dataset_unm
+      size: 256
+      image_interpolation: bilinear
+      mask_interpolation: nearest
+    train:
+      target: src.data.unm.VFSSUnmTrain
+    validation:
+      target: src.data.unm.VFSSUnmVal
+    test:
+      target: src.data.unm.VFSSUnmTest
