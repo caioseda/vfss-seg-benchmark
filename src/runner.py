@@ -14,7 +14,12 @@ from src.utils import instantiate_from_config, _to_scalar, _resolve_config_path,
 
 pl.seed_everything(42)
 
-def run_experiment(config_path: str, run_suffix: Optional[str] = None) -> Dict[str, Any]:
+def run_experiment(
+    config_path: str,
+    run_suffix: Optional[str] = None,
+    logs_root: Optional[str | Path] = None,
+    experiment_subdir: Optional[str] = None,
+) -> Dict[str, Any]:
     cfg_path = _resolve_config_path(config_path)
     config = OmegaConf.load(str(cfg_path))
 
@@ -26,8 +31,22 @@ def run_experiment(config_path: str, run_suffix: Optional[str] = None) -> Dict[s
     print(f"Loaded configuration: {cfg_path}")
     print(f"Run version: {run_version}")
 
-    tb_logger = TensorBoardLogger("logs", name=experiment_name, version=run_version)
-    csv_logger = CSVLogger("logs", name=experiment_name, version=run_version)
+    if logs_root is None:
+        tb_logger = TensorBoardLogger("logs", name=experiment_name, version=run_version)
+        csv_logger = CSVLogger("logs", name=experiment_name, version=run_version)
+        output_dir = Path("logs") / experiment_name / run_version
+    else:
+        benchmark_root = Path(logs_root).expanduser().resolve()
+        benchmark_root.mkdir(parents=True, exist_ok=True)
+        exp_dirname = experiment_subdir or experiment_name
+        # Keep one top-level folder per experiment and separate logger outputs inside it.
+        tb_logger = TensorBoardLogger(
+            save_dir=str(benchmark_root), name=exp_dirname, version="tensorboard"
+        )
+        csv_logger = CSVLogger(
+            save_dir=str(benchmark_root), name=exp_dirname, version="csv"
+        )
+        output_dir = benchmark_root / exp_dirname
 
     model = LitWrapper(model_cfg=config.model, optimizer_cfg=config.optimizer)
     data_module = instantiate_from_config(config.data)
@@ -59,6 +78,7 @@ def run_experiment(config_path: str, run_suffix: Optional[str] = None) -> Dict[s
         "config_path": str(cfg_path),
         "experiment_name": experiment_name,
         "run_version": run_version,
+        "output_dir": str(output_dir),
         "fit_metrics": {k: _to_scalar(v) for k, v in fit_metrics.items()},
         "test_metrics": {k: _to_scalar(v) for k, v in test_metrics.items()},
     }
