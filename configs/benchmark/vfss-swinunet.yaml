@@ -1,0 +1,6 @@
+benchmark_name: vfss-swinunet
+experiments:
+  - configs/experiment/swinunet/swinunet-tiny.yaml
+  - configs/experiment/swinunet/swinunet-tiny-wo-pretrained.yaml
+  - configs/experiment/swinunet/swinunet-small.yaml
+  - configs/experiment/swinunet/swinunet-base.yaml

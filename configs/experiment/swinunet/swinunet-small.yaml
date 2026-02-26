@@ -1,0 +1,58 @@
+experiment_name: vfss-inca-swinunet-small
+
+model:
+  target: src.models.swin_unet.adapters.SwinUNet
+  params:
+    n_channels: 3
+    n_classes: 2
+    image_size: 256
+    drop_path_rate: 0.2
+    drop_rate: 0.0
+    pretrain_ckpt: model_weights/swin-transformer/swin-tiny/swin_tiny_patch4_window7_224.pth
+    swin:
+      patch_size: 4
+      in_chans: 3
+      embed_dim: 96
+      depths: [2, 2, 18, 2]
+      decoder_depths: [2, 2, 2, 1]
+      num_heads: [3, 6, 12, 24]
+      window_size: 8
+      mlp_ratio: 4.0
+      qkv_bias: true
+      qk_scale: null
+      ape: false
+      patch_norm: true
+      final_upsample: expand_first
+
+optimizer:
+  target: torch.optim.Adam
+  params:
+    lr: 1e-3
+
+trainer:
+  target: src.trainers.base.TrainerFromConfig
+  params:
+    max_epochs: 100
+    accelerator: auto
+    devices: auto
+    check_val_every_n_epoch: 2
+    accumulate_grad_batches: 1
+  callbacks:
+    - target: src.callbacks.PrintDeviceCallback
+    - target: pytorch_lightning.callbacks.DeviceStatsMonitor
+
+data:
+  target: src.data.base.DataModuleFromConfig
+  params:
+    batch_size: 8
+    num_workers: 8
+    wrap: false
+    shared_dataset_params:
+      data_root: ../dados_inca/metadados
+      size: 256
+    train:
+      target: src.data.vfss.VFSSIncaTrain
+    validation:
+      target: src.data.vfss.VFSSIncaVal
+    test:
+      target: src.data.vfss.VFSSIncaTest
