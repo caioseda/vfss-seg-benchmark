@@ -1,9 +1,10 @@
 from copy import deepcopy
 
 from omegaconf import DictConfig, OmegaConf
+import torch
 from torch import nn
 
-from .official_transunet import VisionTransformer
+from .transunet import VisionTransformer
 
 class TransUNet(nn.Module):
     def __init__(
@@ -11,6 +12,7 @@ class TransUNet(nn.Module):
         n_channels: int,
         n_classes: int,
         image_size: int = 256,
+        patch_size: int | None = None,
         vis: bool = False,
         vit_config: dict | DictConfig | None = None,
     ):
@@ -20,6 +22,9 @@ class TransUNet(nn.Module):
 
         config = OmegaConf.create(deepcopy(vit_config))
         config.n_classes = n_classes
+        if patch_size is not None:
+            config.patch_size = patch_size
+            config.patches.size = [patch_size, patch_size]
 
         if config.get("n_skip") is None:
             config.n_skip = 0
@@ -34,6 +39,14 @@ class TransUNet(nn.Module):
             num_classes=n_classes,
             vis=vis,
         )
+        if config.get("pretrained_path"):
+            try:
+                checkpoint = torch.load(config.pretrained_path, map_location="cpu", weights_only=True)
+            except TypeError:
+                checkpoint = torch.load(config.pretrained_path, map_location="cpu")
+            if isinstance(checkpoint, dict) and "state_dict" in checkpoint and "vit.embeddings.patch_embeddings.projection.weight" not in checkpoint:
+                checkpoint = checkpoint["state_dict"]
+            self.model.load_from(weights=checkpoint)
 
     def forward(self, x):
         return self.model(x)

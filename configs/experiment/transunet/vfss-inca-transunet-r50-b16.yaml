@@ -1,7 +1,7 @@
 experiment_name: vfss-inca-transunet-r50-b16
 
 model:
-  target: src.models.transunet.adapters.TransUNet
+  target: src.models.trans_unet.adapters.TransUNet
   params:
     n_channels: 3
     n_classes: 2
