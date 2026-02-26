@@ -8,6 +8,7 @@ The datasets used for benchmarking consists of both publicly available and priva
 ## Models Evaluated
 - U-Net
 - TransUNet
+- SwinUNet
 
 ## Evaluation Metrics
 The models are evaluated using the following metrics:
