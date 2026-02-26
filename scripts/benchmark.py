@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Dict, List
 
 from omegaconf import ListConfig, OmegaConf
+from tqdm.auto import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -98,18 +99,30 @@ if __name__ == "__main__":
     print(f"Total experiments: {len(experiment_paths)}")
 
     results = []
-    for idx, exp_path in enumerate(experiment_paths, start=1):
-        exp_stem = Path(exp_path).stem
-        experiment_subdir = f"{idx:02d}-{exp_stem}"
-        suffix = f"{benchmark_name}-{idx:02d}"
-        print(f"\n[{idx}/{len(experiment_paths)}] Running: {exp_path}")
-        result = run_experiment(
-            exp_path,
-            run_suffix=suffix,
-            logs_root=benchmark_run_dir,
-            experiment_subdir=experiment_subdir,
-        )
-        results.append(result)
+    benchmark_progress = tqdm(
+        total=len(experiment_paths),
+        desc="Benchmark Progress",
+        unit="exp",
+        dynamic_ncols=True,
+        leave=True,
+    )
+    try:
+        for idx, exp_path in enumerate(experiment_paths, start=1):
+            exp_stem = Path(exp_path).stem
+            experiment_subdir = f"{idx:02d}-{exp_stem}"
+            suffix = f"{benchmark_name}-{idx:02d}"
+            print(f"\n[{idx}/{len(experiment_paths)}] Running: {exp_path}")
+            result = run_experiment(
+                exp_path,
+                run_suffix=suffix,
+                logs_root=benchmark_run_dir,
+                experiment_subdir=experiment_subdir,
+                fast_dev_run=args.fast_dev_run,
+            )
+            results.append(result)
+            benchmark_progress.update(1)
+    finally:
+        benchmark_progress.close()
 
     results_csv = benchmark_run_dir / "results.csv"
     _save_benchmark_csv(results, results_csv)

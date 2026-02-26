@@ -10,4 +10,4 @@ from src.runner import run_experiment
 
 if __name__ == "__main__":
     args = get_cli_args(default_config="configs/vfss-inca-unet.yaml")
-    run_experiment(args.config)
+    run_experiment(args.config, fast_dev_run=args.fast_dev_run)

@@ -7,7 +7,7 @@ import torch
 from omegaconf import OmegaConf
 from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
 
-from src.callbacks import build_callbacks
+from src.callbacks import OverallTrainingProgressBar, build_callbacks
 from src.models import LitWrapper
 from src.utils import instantiate_from_config, _to_scalar, _resolve_config_path, _print_metric_block
 
@@ -19,6 +19,7 @@ def run_experiment(
     run_suffix: Optional[str] = None,
     logs_root: Optional[str | Path] = None,
     experiment_subdir: Optional[str] = None,
+    fast_dev_run: bool | int = False,
 ) -> Dict[str, Any]:
     cfg_path = _resolve_config_path(config_path)
     config = OmegaConf.load(str(cfg_path))
@@ -53,7 +54,12 @@ def run_experiment(
 
     callbacks_cfg = config.trainer.get("callbacks", [])
     callbacks = build_callbacks(callbacks_cfg)
+    if not any(isinstance(callback, OverallTrainingProgressBar) for callback in callbacks):
+        callbacks.append(OverallTrainingProgressBar())
     trainer_params = config["trainer"]["params"]
+    if fast_dev_run:
+        trainer_params["fast_dev_run"] = fast_dev_run
+        print(f"fast_dev_run enabled via CLI override: {fast_dev_run}")
 
     trainer = pl.Trainer(
         logger=[tb_logger, csv_logger],

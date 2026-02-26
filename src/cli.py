@@ -14,6 +14,17 @@ def _add_arguments(parser: argparse.ArgumentParser, default_config: str) -> argp
         default=default_config,
         help="Path to the YAML configuration file for the experiment.",
     )
+    parser.add_argument(
+        "--fast-dev-run",
+        nargs="?",
+        const=True,
+        default=False,
+        type=int,
+        help=(
+            "Enable PyTorch Lightning fast_dev_run. Use flag alone for True "
+            "or pass an integer number of batches (e.g. --fast-dev-run 5)."
+        ),
+    )
     return parser
 
 def get_cli_args(argparse_description='', default_config: str=''):
