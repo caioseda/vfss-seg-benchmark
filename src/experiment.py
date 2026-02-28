@@ -1,6 +1,6 @@
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from src.cli import get_cli_args
 
 import pytorch_lightning as pl
@@ -62,15 +62,12 @@ class Experiment:
         return config
 
 
-    def setup_loggers(self) -> Dict[str, Any]:
+    def setup_loggers(self) -> List[Any]:
         # Keep logger artifacts colocated with console output for this run.
         save_dir = str(self.experiment_run_dir)
         tb_logger = TensorBoardLogger(save_dir=save_dir, name="", version="tensorboard")
         csv_logger = CSVLogger(save_dir=save_dir, name="", version="csv")
-        return {
-            "tensorboard": tb_logger,
-            "csv": csv_logger,
-        }
+        return [tb_logger, csv_logger]
 
     def run(self, fast_dev_run: bool | int = False, seed=42) -> Dict[str, Any]:
         pl.seed_everything(seed)
