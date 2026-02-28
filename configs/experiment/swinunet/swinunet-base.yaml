@@ -1,4 +1,5 @@
-experiment_name: vfss-inca-swinunet-base
+name: vfss-inca-swinunet-base
+type: experiment
 
 model:
   target: src.models.swin_unet.adapters.SwinUNet
@@ -25,9 +26,10 @@ model:
       final_upsample: expand_first
 
 optimizer:
-  target: torch.optim.Adam
+  target: torch.optim.AdamW
   params:
     lr: 1e-3
+    weight_decay: 1e-4
 
 trainer:
   target: src.trainers.base.TrainerFromConfig

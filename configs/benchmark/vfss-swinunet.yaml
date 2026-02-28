@@ -1,6 +1,57 @@
-benchmark_name: vfss-swinunet
+name: vfss-swinunet
+type: benchmark
 experiments:
   - configs/experiment/swinunet/swinunet-tiny.yaml
-  - configs/experiment/swinunet/swinunet-tiny-wo-pretrained.yaml
-  - configs/experiment/swinunet/swinunet-small.yaml
   - configs/experiment/swinunet/swinunet-base.yaml
+
+optimizer:
+  target: torch.optim.AdamW
+  params:
+    lr: 1e-3
+    weight_decay: 1e-4
+  
+trainer:
+  target: src.trainers.base.TrainerFromConfig
+  params:
+    max_epochs: 100
+    accelerator: auto
+    devices: auto
+    check_val_every_n_epoch: 2
+    accumulate_grad_batches: 1
+  callbacks:
+    - target: src.callbacks.PrintDeviceCallback
+    - target: pytorch_lightning.callbacks.DeviceStatsMonitor
+
+datasets:
+  - inca:
+      target: src.data.base.DataModuleFromConfig
+      params:
+        batch_size: 8
+        num_workers: 8
+        wrap: False
+        shared_dataset_params:
+          data_root: ../dados_inca/metadados
+          size: 256
+        train:
+          target: src.data.vfss.VFSSIncaTrain
+        validation:
+          target: src.data.vfss.VFSSIncaVal
+        test:
+          target: src.data.vfss.VFSSIncaTest
+  - unm:
+      target: src.data.base.DataModuleFromConfig
+      params:
+        batch_size: 8
+        num_workers: 8
+        wrap: False
+        shared_dataset_params:
+          data_root: /data_ssd/caioseda/data/dataset_unm
+          size: 256
+          image_interpolation: bilinear
+          mask_interpolation: nearest
+        train:
+          target: src.data.unm.VFSSUnmTrain 
+        validation:
+          target: src.data.unm.VFSSUnmVal
+        test:
+          target: src.data.unm.VFSSUnmTest

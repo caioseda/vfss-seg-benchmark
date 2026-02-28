@@ -1,4 +1,5 @@
-experiment_name: vfss-unm-transunet-b16
+name: vfss-unm-transunet-b16
+type: experiment
 
 model:
   target: src.models.trans_unet.adapters.TransUNet
@@ -27,9 +28,10 @@ model:
       activation: softmax
 
 optimizer:
-  target: torch.optim.Adam
+  target: torch.optim.AdamW
   params:
     lr: 1e-3
+    weight_decay: 1e-4
 
 trainer:
   target: src.trainers.base.TrainerFromConfig
