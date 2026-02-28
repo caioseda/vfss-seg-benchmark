@@ -10,3 +10,4 @@ log/
 mlrus/*
 *.bin
 *.pth
+*.ipynb
