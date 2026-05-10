@@ -1,4 +1,4 @@
-name: vfss-inca-swinunet-small
+name: vfss-inca-swinunet-tiny
 type: experiment
 
 model:
@@ -14,7 +14,7 @@ model:
       patch_size: 4
       in_chans: 3
       embed_dim: 96
-      depths: [2, 2, 18, 2]
+      depths: [2, 2, 6, 2]
       decoder_depths: [2, 2, 2, 1]
       num_heads: [3, 6, 12, 24]
       window_size: 8
@@ -47,6 +47,7 @@ trainer:
     accumulate_grad_batches: 1
   callbacks:
     - target: src.callbacks.PrintDeviceCallback
+    
 
 data:
   target: src.data.base.DataModuleFromConfig
@@ -56,7 +57,7 @@ data:
     wrap: false
     shared_dataset_params:
       data_root: ../dados_inca/metadados
-      size: 256
+      size: 224
     train:
       target: src.data.vfss.VFSSIncaTrain
     validation:

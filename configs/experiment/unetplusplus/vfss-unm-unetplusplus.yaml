@@ -1,12 +1,16 @@
-name: vfss-unet
+name: vfss-unm-unetplusplus
 type: experiment
 
 model:
-  target: src.models.unet.UNet
+  target: src.models.unet_plus_plus.adapters.UNetPlusPlus
   params:
     n_channels: 3
     n_classes: 2
-    bilinear: True
+    base_num_features: 32
+    num_pool: 5
+    num_conv_per_stage: 2
+    feat_map_mul_on_downscale: 2
+    deep_supervision: False
 
 optimizer:
   target: torch.optim.AdamW
@@ -14,17 +18,10 @@ optimizer:
     lr: 1e-3
     weight_decay: 1e-4
 
-lr_scheduler:
-  target: torch.optim.lr_scheduler.CosineAnnealingLR
-  params:
-    T_max: 100
-    eta_min: 1e-6
-
 trainer:
   target: src.trainers.base.TrainerFromConfig
   params:
     max_epochs: 100
-    # max_steps: 10000
     accelerator: auto
     devices: auto
     check_val_every_n_epoch: 2
@@ -32,6 +29,7 @@ trainer:
   callbacks:
     - target: src.callbacks.PrintDeviceCallback
     
+
 data:
   target: src.data.base.DataModuleFromConfig
   params:
@@ -39,14 +37,13 @@ data:
     num_workers: 8
     wrap: False
     shared_dataset_params:
-      dataset_path: /data_ssd/caioseda/data/dataset_inca_all_frames/
+      data_root: /data_ssd/caioseda/data/dataset_unm
       size: 256
-      window_size: 1
-      stride: 1
-      repeat_channels: True
+      image_interpolation: bilinear
+      mask_interpolation: nearest
     train:
-      target: src.data.vfss_v2.VFSSIncaTrain
+      target: src.data.unm.VFSSUnmTrain
     validation:
-      target: src.data.vfss_v2.VFSSIncaVal
+      target: src.data.unm.VFSSUnmVal
     test:
-      target: src.data.vfss_v2.VFSSIncaTest
+      target: src.data.unm.VFSSUnmTest

@@ -1,7 +1,74 @@
 name: vfss-baseline
 type: benchmark
 experiments:
-  - configs/experiment/unet/vfss-inca-unet.yaml
-  - configs/experiment/unet/vfss-unm-unet.yaml
-  - configs/experiment/transunet/vfss-inca-transunet-r50-b16.yaml
-  - configs/experiment/transunet/vfss-unm-transunet-r50-b16.yaml
+  - configs/experiment/unet/vfss-inca-unet.yaml #
+  - configs/experiment/unet/vfss-unm-unet.yaml #
+  - configs/experiment/swinunet/vfss-inca-swinunet-tiny.yaml #
+  # - configs/experiment/swinunet/vfss-unm-swinunet-tiny.yaml
+  - configs/experiment/swinunet/vfss-inca-swinunet-small.yaml #
+  # - configs/experiment/swinunet/vfss-unm-swinunet-small.yaml
+  # - configs/experiment/transunet/vfss-inca-transunet-b16.yaml #
+  # - configs/experiment/transunet/vfss-unm-transunet-b16.yaml
+  - configs/experiment/transunet/vfss-inca-transunet-r50-b16.yaml #
+  # - configs/experiment/transunet/vfss-unm-transunet-r50-b16.yaml
+
+
+optimizer:
+  target: torch.optim.AdamW
+  params:
+    lr: 1e-3
+    weight_decay: 1e-4
+  
+trainer:
+  target: src.trainers.base.TrainerFromConfig
+  params:
+    max_epochs: 100
+    accelerator: auto
+    devices: auto
+    check_val_every_n_epoch: 2
+    accumulate_grad_batches: 1
+  callbacks:
+    - target: src.callbacks.PrintDeviceCallback
+
+lr_scheduler:
+  target: torch.optim.lr_scheduler.CosineAnnealingLR
+  params:
+    T_max: 100
+    eta_min: 1e-6    
+
+datasets:
+  - inca:
+      target: src.data.base.DataModuleFromConfig
+      params:
+        batch_size: 8
+        num_workers: 8
+        wrap: False
+        shared_dataset_params:
+          dataset_path: /data_ssd/caioseda/data/dataset_inca_all_frames/
+          size: 256
+          window_size: 1
+          stride: 1
+          repeat_channels: True
+        train:
+          target: src.data.vfss_v2.VFSSIncaTrain
+        validation:
+          target: src.data.vfss_v2.VFSSIncaVal
+        test:
+          target: src.data.vfss_v2.VFSSIncaTest
+  - unm:
+      target: src.data.base.DataModuleFromConfig
+      params:
+        batch_size: 8
+        num_workers: 8
+        wrap: False
+        shared_dataset_params:
+          data_root: /data_ssd/caioseda/data/dataset_unm
+          size: 256
+          image_interpolation: bilinear
+          mask_interpolation: nearest
+        train:
+          target: src.data.unm.VFSSUnmTrain 
+        validation:
+          target: src.data.unm.VFSSUnmVal
+        test:
+          target: src.data.unm.VFSSUnmTest

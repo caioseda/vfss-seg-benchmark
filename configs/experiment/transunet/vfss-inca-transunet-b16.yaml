@@ -8,10 +8,10 @@ model:
     n_classes: 2
     image_size: 256
     vis: False
-    patch_size: 16
     vit_config:
       patches:
         size: [16, 16]
+        grid: [16, 16]
       hidden_size: 768
       transformer:
         mlp_dim: 3072
@@ -26,6 +26,7 @@ model:
         num_layers: (3, 4, 9)
         width_factor: 1
       pretrained_path: null
+      patch_size: 16
       decoder_channels: [256, 128, 64, 16]
       skip_channels: [512, 256, 64, 16]
       n_classes: 2
@@ -38,6 +39,12 @@ optimizer:
     lr: 1e-3
     weight_decay: 1e-4
 
+lr_scheduler:
+  target: torch.optim.lr_scheduler.CosineAnnealingLR
+  params:
+    T_max: 100
+    eta_min: 1e-6
+
 trainer:
   target: src.trainers.base.TrainerFromConfig
   params:
@@ -48,7 +55,7 @@ trainer:
     accumulate_grad_batches: 1
   callbacks:
     - target: src.callbacks.PrintDeviceCallback
-    - target: pytorch_lightning.callbacks.DeviceStatsMonitor
+    
 
 data:
   target: src.data.base.DataModuleFromConfig
@@ -57,11 +64,14 @@ data:
     num_workers: 8
     wrap: False
     shared_dataset_params:
-      data_root: ../dados_inca/metadados
+      dataset_path: /data_ssd/caioseda/data/dataset_inca_all_frames/
       size: 256
+      window_size: 1
+      stride: 1
+      repeat_channels: True
     train:
-      target: src.data.vfss.VFSSIncaTrain
+      target: src.data.vfss_v2.VFSSIncaTrain
     validation:
-      target: src.data.vfss.VFSSIncaVal
+      target: src.data.vfss_v2.VFSSIncaVal
     test:
-      target: src.data.vfss.VFSSIncaTest
+      target: src.data.vfss_v2.VFSSIncaTest

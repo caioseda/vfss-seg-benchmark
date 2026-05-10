@@ -1,8 +1,8 @@
 name: vfss-swinunet
 type: benchmark
 experiments:
+  - configs/experiment/swinunet/swinunet-small.yaml
   - configs/experiment/swinunet/swinunet-tiny.yaml
-  - configs/experiment/swinunet/swinunet-base.yaml
 
 optimizer:
   target: torch.optim.AdamW
@@ -20,7 +20,12 @@ trainer:
     accumulate_grad_batches: 1
   callbacks:
     - target: src.callbacks.PrintDeviceCallback
-    - target: pytorch_lightning.callbacks.DeviceStatsMonitor
+
+lr_scheduler:
+  target: torch.optim.lr_scheduler.CosineAnnealingLR
+  params:
+    T_max: 100
+    eta_min: 1e-6    
 
 datasets:
   - inca:

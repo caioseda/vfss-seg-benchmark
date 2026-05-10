@@ -1,4 +1,4 @@
-name: vfss-inca-swinunet-small
+name: vfss-unm-swinunet-tiny
 type: experiment
 
 model:
@@ -14,7 +14,7 @@ model:
       patch_size: 4
       in_chans: 3
       embed_dim: 96
-      depths: [2, 2, 18, 2]
+      depths: [2, 2, 6, 2]
       decoder_depths: [2, 2, 2, 1]
       num_heads: [3, 6, 12, 24]
       window_size: 8
@@ -31,11 +31,7 @@ optimizer:
     lr: 1e-3
     weight_decay: 1e-4
 
-lr_scheduler:
-  target: torch.optim.lr_scheduler.CosineAnnealingLR
-  params:
-    T_max: 100
-    eta_min: 1e-6
+
 
 trainer:
   target: src.trainers.base.TrainerFromConfig
@@ -47,19 +43,22 @@ trainer:
     accumulate_grad_batches: 1
   callbacks:
     - target: src.callbacks.PrintDeviceCallback
+    
 
 data:
   target: src.data.base.DataModuleFromConfig
   params:
     batch_size: 8
     num_workers: 8
-    wrap: false
+    wrap: False
     shared_dataset_params:
-      data_root: ../dados_inca/metadados
+      data_root: /data_ssd/caioseda/data/dataset_unm
       size: 256
+      image_interpolation: bilinear
+      mask_interpolation: nearest
     train:
-      target: src.data.vfss.VFSSIncaTrain
+      target: src.data.unm.VFSSUnmTrain
     validation:
-      target: src.data.vfss.VFSSIncaVal
+      target: src.data.unm.VFSSUnmVal
     test:
-      target: src.data.vfss.VFSSIncaTest
+      target: src.data.unm.VFSSUnmTest

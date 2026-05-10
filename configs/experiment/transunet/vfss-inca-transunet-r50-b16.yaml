@@ -39,6 +39,12 @@ optimizer:
     lr: 1e-3
     weight_decay: 1e-4
 
+lr_scheduler:
+  target: torch.optim.lr_scheduler.CosineAnnealingLR
+  params:
+    T_max: 100
+    eta_min: 1e-6
+
 trainer:
   target: src.trainers.base.TrainerFromConfig
   params:
@@ -49,7 +55,6 @@ trainer:
     accumulate_grad_batches: 1
   callbacks:
     - target: src.callbacks.PrintDeviceCallback
-    - target: pytorch_lightning.callbacks.DeviceStatsMonitor
 
 data:
   target: src.data.base.DataModuleFromConfig
@@ -58,11 +63,14 @@ data:
     num_workers: 8
     wrap: False
     shared_dataset_params:
-      data_root: ../dados_inca/metadados
+      dataset_path: /data_ssd/caioseda/data/dataset_inca_all_frames/
       size: 256
+      window_size: 1
+      stride: 1
+      repeat_channels: True
     train:
-      target: src.data.vfss.VFSSIncaTrain
+      target: src.data.vfss_v2.VFSSIncaTrain
     validation:
-      target: src.data.vfss.VFSSIncaVal
+      target: src.data.vfss_v2.VFSSIncaVal
     test:
-      target: src.data.vfss.VFSSIncaTest
+      target: src.data.vfss_v2.VFSSIncaTest

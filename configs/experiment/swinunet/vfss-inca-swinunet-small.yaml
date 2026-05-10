@@ -53,13 +53,16 @@ data:
   params:
     batch_size: 8
     num_workers: 8
-    wrap: false
+    wrap: False
     shared_dataset_params:
-      data_root: ../dados_inca/metadados
+      dataset_path: /data_ssd/caioseda/data/dataset_inca_all_frames/
       size: 256
+      window_size: 1
+      stride: 1
+      repeat_channels: True
     train:
-      target: src.data.vfss.VFSSIncaTrain
+      target: src.data.vfss_v2.VFSSIncaTrain
     validation:
-      target: src.data.vfss.VFSSIncaVal
+      target: src.data.vfss_v2.VFSSIncaVal
     test:
-      target: src.data.vfss.VFSSIncaTest
+      target: src.data.vfss_v2.VFSSIncaTest
