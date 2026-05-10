@@ -6,16 +6,18 @@ from ..utils import instantiate_from_config, get_obj_from_str
 
 
 class LitWrapper(pl.LightningModule):
-    def __init__(self, model_cfg, optimizer_cfg):
+    def __init__(self, model_cfg, optimizer_cfg, lr_scheduler_cfg=None):
         super().__init__()
         self.save_hyperparameters(
             {
                 "model_cfg": self._to_serializable(model_cfg),
                 "optimizer_cfg": self._to_serializable(optimizer_cfg),
+                "lr_scheduler_cfg": self._to_serializable(lr_scheduler_cfg),
             }
         )
         self.model_cfg = model_cfg
         self.optimizer_cfg = optimizer_cfg
+        self.lr_scheduler_cfg = lr_scheduler_cfg
         self.model = instantiate_from_config(model_cfg)
         self.n_classes = self.model.n_classes
 
@@ -110,4 +112,20 @@ class LitWrapper(pl.LightningModule):
         optimizer = optimizer_cls(
             self.model.parameters(), **optimizer_params
         )
-        return optimizer
+        if self.lr_scheduler_cfg is None:
+            return optimizer
+
+        scheduler_cls = get_obj_from_str(self.lr_scheduler_cfg["target"])
+        scheduler_params = self.lr_scheduler_cfg.get("params", {})
+        scheduler = scheduler_cls(optimizer, **scheduler_params)
+
+        scheduler_config = {"scheduler": scheduler}
+        for key in ("interval", "frequency", "monitor", "strict", "name"):
+            value = self.lr_scheduler_cfg.get(key)
+            if value is not None:
+                scheduler_config[key] = value
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": scheduler_config,
+        }
