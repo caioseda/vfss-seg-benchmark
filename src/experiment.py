@@ -52,7 +52,6 @@ class Experiment:
         resolved_path = _resolve_config_path(cfg_path)
         config = OmegaConf.load(str(resolved_path))
 
-        # Assert required fields
         _required_fields = ['model', 'optimizer', 'data', 'trainer']
         for field in _required_fields:
             if field not in config:
@@ -63,7 +62,6 @@ class Experiment:
 
 
     def setup_loggers(self) -> List[Any]:
-        # Keep logger artifacts colocated with console output for this run.
         save_dir = str(self.experiment_run_dir)
         tb_logger = TensorBoardLogger(save_dir=save_dir, name="", version="tensorboard")
         csv_logger = CSVLogger(save_dir=save_dir, name="", version="csv")
@@ -79,7 +77,11 @@ class Experiment:
             print(f"Loaded configuration: {self.config_path}")
             print(f"Console logs: {self.console_log_path}")
             
-            model = LitWrapper(model_cfg=self.config.model, optimizer_cfg=self.config.optimizer)
+            model = LitWrapper(
+                model_cfg=self.config.model,
+                optimizer_cfg=self.config.optimizer,
+                lr_scheduler_cfg=self.config.get("lr_scheduler"),
+            )
             data_module = instantiate_from_config(self.config.data)
 
             callbacks_cfg = self.config.trainer.get("callbacks", [])
