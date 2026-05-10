@@ -1,10 +1,12 @@
 import importlib
+import re
 import sys
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
-from typing import Any, Dict, Iterator, TextIO
+from typing import Any, Dict, Iterator, TextIO, Union
 
 import torch
+import os
 
 
 def instantiate_from_config(config: Dict) -> object:
@@ -88,6 +90,12 @@ def _flatten_result_for_csv(result: Dict, index: int) -> Dict[str, object]:
         row[f"test::{k}"] = v
     return row
 
+def _resolve_path(path: Union[str,  Path]) -> Path:
+    '''Resolve a potentially relative path using the current working directory.'''
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Path not found: {path}")
+
+    return Path(path).expanduser().resolve()
 
 class _TeeStream:
     def __init__(self, *streams: TextIO):
@@ -106,13 +114,46 @@ class _TeeStream:
         return any(getattr(stream, "isatty", lambda: False)() for stream in self._streams)
 
 
+_ANSI_ESCAPE_RE = re.compile(
+    r"""
+    \x1B
+    (?:
+        \[[0-?]*[ -/]*[@-~]      # CSI sequences, including colors and cursor movement.
+        |\][^\x07]*(?:\x07|\x1B\\) # OSC sequences.
+        |[@-Z\\-_]                # Other single-character escape sequences.
+    )
+    """,
+    re.VERBOSE,
+)
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+class _ConsoleLogStream:
+    def __init__(self, stream: TextIO):
+        self._stream = stream
+
+    def write(self, data: str) -> int:
+        clean_data = _ANSI_ESCAPE_RE.sub("", data)
+        clean_data = clean_data.replace("\r", "\n")
+        clean_data = _CONTROL_CHARS_RE.sub("", clean_data)
+        self._stream.write(clean_data)
+        return len(data)
+
+    def flush(self) -> None:
+        self._stream.flush()
+
+    def isatty(self) -> bool:
+        return False
+
+
 @contextmanager
-def capture_console_output(log_path: str | Path) -> Iterator[None]:
+def capture_console_output(log_path: Union[str, Path]) -> Iterator[None]:
     '''Context manager to capture console output to a log file while still printing to the console.'''
     resolved_log_path = Path(log_path).expanduser().resolve()
     resolved_log_path.parent.mkdir(parents=True, exist_ok=True)
     with resolved_log_path.open("a", encoding="utf-8") as log_file:
-        tee_stdout = _TeeStream(sys.stdout, log_file)
-        tee_stderr = _TeeStream(sys.stderr, log_file)
+        clean_log_file = _ConsoleLogStream(log_file)
+        tee_stdout = _TeeStream(sys.stdout, clean_log_file)
+        tee_stderr = _TeeStream(sys.stderr, clean_log_file)
         with redirect_stdout(tee_stdout), redirect_stderr(tee_stderr):
             yield
