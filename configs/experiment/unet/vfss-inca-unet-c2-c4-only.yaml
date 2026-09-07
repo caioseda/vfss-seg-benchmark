@@ -44,10 +44,10 @@ data:
       window_size: 1
       stride: 1
       repeat_channels: True
-      target_folder: 'target_binary_c2_c4'
+      target_variant: 'binary_c2_c4'
     train:
-      target: src.data.vfss_v2.VFSSIncaTrain
+      target: src.data.vfss_frame_dataset.VFSSIncaTrain
     validation:
-      target: src.data.vfss_v2.VFSSIncaVal
+      target: src.data.vfss_frame_dataset.VFSSIncaVal
     test:
-      target: src.data.vfss_v2.VFSSIncaTest
+      target: src.data.vfss_frame_dataset.VFSSIncaTest

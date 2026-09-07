@@ -8,6 +8,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from ..utils import instantiate_from_config
+from .samplers import labeled_unlabeled_indices
 
 
 class _LenGetItemWrapper:
@@ -47,6 +48,7 @@ class DataModuleFromConfig(pl.LightningDataModule):
         shuffle_test_loader: bool = False,
         shared_dataset_params: Optional[Dict[str, Any]] = None,
         base_kwargs: Optional[Dict[str, Any]] = None,
+        train_batch_sampler: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
 
@@ -75,6 +77,8 @@ class DataModuleFromConfig(pl.LightningDataModule):
         self._shuffle_val = shuffle_val_dataloader
         self._shuffle_test = shuffle_test_loader
         self.datasets: Dict[str, Any] = {}
+        self.train_batch_sampler_config = train_batch_sampler
+        self._train_batch_sampler = None
 
     def _build_dataset_config(self, dataset_cfg: Dict[str, Any]) -> Dict[str, Any]:
         cfg = copy.deepcopy(dataset_cfg)
@@ -101,9 +105,26 @@ class DataModuleFromConfig(pl.LightningDataModule):
                 for name, dataset in self.datasets.items()
             }
 
+        if self.train_batch_sampler_config is not None and "train" in self.datasets:
+            labeled_idx, unlabeled_idx = labeled_unlabeled_indices(self.datasets["train"])
+            sampler_cfg = copy.deepcopy(self.train_batch_sampler_config)
+            sampler_cfg.setdefault("params", {})
+            sampler_cfg["params"]["labeled_indices"] = labeled_idx
+            sampler_cfg["params"]["unlabeled_indices"] = unlabeled_idx
+            self._train_batch_sampler = instantiate_from_config(sampler_cfg)
+
     def _make_loader(self, split: str, shuffle: bool) -> DataLoader:
         if split not in self.datasets:
             raise KeyError(f"Split '{split}' was not configured.")
+
+        if split == "train" and self._train_batch_sampler is not None:
+            return DataLoader(
+                self.datasets[split],
+                batch_sampler=self._train_batch_sampler,
+                num_workers=self.num_workers,
+                pin_memory=True,
+                worker_init_fn=seed_worker if self.use_worker_init_fn else None,
+            )
 
         return DataLoader(
             self.datasets[split],

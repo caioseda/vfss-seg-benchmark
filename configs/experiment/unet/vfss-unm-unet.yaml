@@ -42,10 +42,22 @@ data:
     num_workers: 8
     wrap: False
     shared_dataset_params:
-      data_root: /data_ssd/caioseda/data/dataset_unm
+      dataset_path: /data_ssd/caioseda/data/dataset_unm
       size: 256
+      window_size: 1
+      stride: 1
+      repeat_channels: True
       image_interpolation: bilinear
       mask_interpolation: nearest
+      # split_mode: 'legado' (default) reproduces the historical train/val/test split via
+      # the `split_legado` column. Set to 'seed' to divide the dataset pool at run time by
+      # `paciente_id`, varying `split_seed` to test alternative splits (recorded in the run
+      # logs for reproducibility).
+      # split_mode: 'seed'
+      # split_seed: 42
+      # split_ratios: [0.7, 0.1, 0.2]
+      # target_type: 'mask'  # 'mask' | 'points'
+      # target_variant: 'raw'  # 'raw' | 'binary_c2_c4' | 'binary_c2_c3_c4' | 'multiclass_c2_c4' | 'multiclass_c2_c3_c4' | 'multiclass_all'
     train:
       target: src.data.unm.VFSSUnmTrain
     validation:

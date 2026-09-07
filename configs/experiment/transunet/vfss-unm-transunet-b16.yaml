@@ -52,8 +52,11 @@ data:
     num_workers: 8
     wrap: False
     shared_dataset_params:
-      data_root: /data_ssd/caioseda/data/dataset_unm
+      dataset_path: /data_ssd/caioseda/data/dataset_unm
       size: 256
+      window_size: 1
+      stride: 1
+      repeat_channels: True
       image_interpolation: bilinear
       mask_interpolation: nearest
     train:

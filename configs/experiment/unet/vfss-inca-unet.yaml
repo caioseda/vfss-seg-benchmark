@@ -44,9 +44,18 @@ data:
       window_size: 1
       stride: 1
       repeat_channels: True
+      # split_mode: 'legado' (default) reproduces the historical train/val/test split via
+      # the `split_legado` column. Set to 'seed' to divide the dataset pool at run time by
+      # `paciente_id`, varying `split_seed` to test alternative splits (recorded in the run
+      # logs for reproducibility).
+      # split_mode: 'seed'
+      # split_seed: 42
+      # split_ratios: [0.7, 0.15, 0.15]
+      # target_type: 'mask'  # 'mask' | 'points'
+      # target_variant: 'raw'  # 'raw' | 'binary_c2_c4' | 'multiclass_c2_c4' | 'multiclass_all'
     train:
-      target: src.data.vfss_v2.VFSSIncaTrain
+      target: src.data.vfss_frame_dataset.VFSSIncaTrain
     validation:
-      target: src.data.vfss_v2.VFSSIncaVal
+      target: src.data.vfss_frame_dataset.VFSSIncaVal
     test:
-      target: src.data.vfss_v2.VFSSIncaTest
+      target: src.data.vfss_frame_dataset.VFSSIncaTest
