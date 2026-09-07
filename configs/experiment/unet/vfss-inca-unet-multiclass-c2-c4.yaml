@@ -1,0 +1,54 @@
+name: vfss-unet-multiclass-c2-c4
+type: experiment
+
+model:
+  target: src.models.unet.UNet
+  params:
+    n_channels: 3
+    n_classes: 4  # background, C2, C3 (unused by this variant), C4
+    bilinear: True
+
+optimizer:
+  target: torch.optim.AdamW
+  params:
+    lr: 1e-3
+    weight_decay: 1e-4
+
+lr_scheduler:
+  target: torch.optim.lr_scheduler.CosineAnnealingLR
+  params:
+    T_max: 100
+    eta_min: 1e-6
+
+trainer:
+  target: src.trainers.base.TrainerFromConfig
+  params:
+    max_epochs: 100
+    # max_steps: 10000
+    accelerator: auto
+    devices: auto
+    check_val_every_n_epoch: 2
+    accumulate_grad_batches: 1
+  callbacks:
+    - target: src.callbacks.PrintDeviceCallback
+
+data:
+  target: src.data.base.DataModuleFromConfig
+  params:
+    batch_size: 8
+    num_workers: 8
+    wrap: False
+    shared_dataset_params:
+      dataset_path: /data_ssd/caioseda/data/dataset_inca_all_frames/
+      size: 256
+      window_size: 1
+      stride: 1
+      repeat_channels: True
+      mask_interpolation: nearest  # required for multiclass -- any other interpolation blends class indices
+      target_variant: 'multiclass_c2_c4'  # 'raw' | 'binary_c2_c4' | 'multiclass_c2_c4' | 'multiclass_all'
+    train:
+      target: src.data.vfss_frame_dataset.VFSSIncaTrain
+    validation:
+      target: src.data.vfss_frame_dataset.VFSSIncaVal
+    test:
+      target: src.data.vfss_frame_dataset.VFSSIncaTest

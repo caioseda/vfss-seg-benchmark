@@ -249,6 +249,7 @@ class VFSSFrameDatasetBase(Dataset):
         self.target_type = target_type
         self.target_variant = target_variant
         self.target_variants = tuple(target_variants)
+        self._is_multiclass_target = target_variant.startswith("multiclass")
         self.video_frame_df = with_target_type(self.video_frame_df, target_type)
         self.video_frame_df = with_target_variant(self.video_frame_df, target_variant)
 
@@ -299,6 +300,13 @@ class VFSSFrameDatasetBase(Dataset):
         self.repeat_channels = repeat_channels
         self.image_interpolation = self._parse_interpolation(image_interpolation)
         self.mask_interpolation = self._parse_interpolation(mask_interpolation)
+
+        if self._is_multiclass_target and self.mask_interpolation != T.InterpolationMode.NEAREST:
+            raise ValueError(
+                f"mask_interpolation must be 'nearest' for multiclass target_variant='{target_variant}' "
+                f"(got '{mask_interpolation}') -- any other interpolation blends class indices into "
+                "meaningless intermediate values."
+            )
 
         if image_transform:
             self.image_transform = image_transform
@@ -425,8 +433,21 @@ class VFSSFrameDatasetBase(Dataset):
         return image
 
     def _preprocess_mask(self, mask: torch.Tensor):
-        '''Preprocess the mask tensor (e.g., normalization)'''
+        '''Preprocess the mask tensor (resize + binarize for binary/raw targets, or resize while
+        preserving class indices for multiclass targets -- see `self._is_multiclass_target`).'''
         logger.debug(f"Original mask dimension: {mask.shape} ({mask.dtype}). Range: [{mask.min()}, {mask.max()}]")
+
+        if self._is_multiclass_target:
+            mask = mask.long()
+
+            if self.target_transform:
+                mask = self.target_transform(mask)
+
+            if mask.ndim == 3 and mask.shape[0] == 1:
+                mask = mask.squeeze(0)
+
+            logger.debug(f"Preprocessed mask dimension: {mask.shape} ({mask.dtype}). Range: [{mask.min()}, {mask.max()}]")
+            return mask.long()
 
         if mask.max() > 1.0:
             mask = mask.float() / 255.0

@@ -3,6 +3,7 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 from torchmetrics.functional.segmentation import mean_iou, dice_score
 from ..utils import instantiate_from_config, get_obj_from_str
+from ..metrics import average_symmetric_surface_distance, hausdorff_distance_95
 
 
 class LitWrapper(pl.LightningModule):
@@ -33,11 +34,14 @@ class LitWrapper(pl.LightningModule):
     @torch.no_grad()
     def compute_metrics(self, y_logits, y):
         y_pred = y_logits.argmax(dim=1)
-        y_int = y.int()
+        y_int = y.long()
 
-        metrics_dict = dict()
         mean_iou_score = mean_iou(
-            y_pred, y_int, num_classes=self.model.n_classes, include_background=False
+            y_pred,
+            y_int,
+            num_classes=self.model.n_classes,
+            include_background=False,
+            input_format="index",
         ).mean()
 
         dice = dice_score(
@@ -46,14 +50,23 @@ class LitWrapper(pl.LightningModule):
             num_classes=self.model.n_classes,
             include_background=False,
             average="micro",
+            input_format="index",
         ).mean()
 
-        metrics_dict = {
+        assd = average_symmetric_surface_distance(
+            y_pred, y_int, num_classes=self.model.n_classes, include_background=False
+        ).nanmean()
+
+        hd95 = hausdorff_distance_95(
+            y_pred, y_int, num_classes=self.model.n_classes, include_background=False
+        ).nanmean()
+
+        return {
             "mean_iou": mean_iou_score,
             "dice_score": dice,
+            "assd": assd,
+            "hd95": hd95,
         }
-
-        return metrics_dict
 
     def compute_loss(self, y_logits, y):
         # y_pred = y_logits.squeeze(1)
