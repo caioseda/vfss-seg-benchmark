@@ -7,6 +7,22 @@ from torchmetrics.functional.segmentation.utils import edge_surface_distance
 DistanceMetric = str  # "euclidean" | "chessboard" | "taxicab"
 
 
+def absent_class_to_nan(values: Tensor) -> Tensor:
+    '''
+    Normalise torchmetrics' "class absent from both prediction and target" sentinel to NaN.
+
+    The metric families in use disagree on this degenerate case: `dice_score(average="none")`
+    returns NaN, `average_symmetric_surface_distance`/`hausdorff_distance_95` below return 0.0
+    (perfect agreement that the structure is not there), but `mean_iou(per_class=True)` returns
+    **-1.0**. Averaged in as-is that sentinel produces a *negative* IoU -- and with
+    `target_variant='multiclass_c2_c4'` class 2 (C3) is absent from every mask, so it would be hit
+    on every single sample.
+
+    Mapping it to NaN makes every metric agree on one convention: aggregate with `.nanmean()`.
+    '''
+    return torch.where(values < 0, torch.full_like(values, float("nan")), values)
+
+
 def _class_masks(x: Tensor, num_classes: int, include_background: bool) -> Tensor:
     '''Convert an index-format segmentation map `[B, H, W]` (class-index values) into one-hot
     boolean masks `[B, C, H, W]`, optionally dropping the background class (index 0).'''

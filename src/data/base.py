@@ -1,14 +1,17 @@
 import copy
+import inspect
+import warnings
 import random
 from typing import Any, Dict, Optional
 
 import numpy as np
 import pytorch_lightning as pl
 import torch
+from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 
-from ..utils import instantiate_from_config
-from .samplers import labeled_unlabeled_indices
+from ..utils import get_obj_from_str, instantiate_from_config
+from .samplers import frame_index_metadata, labeled_unlabeled_indices
 
 
 class _LenGetItemWrapper:
@@ -107,11 +110,47 @@ class DataModuleFromConfig(pl.LightningDataModule):
 
         if self.train_batch_sampler_config is not None and "train" in self.datasets:
             labeled_idx, unlabeled_idx = labeled_unlabeled_indices(self.datasets["train"])
-            sampler_cfg = copy.deepcopy(self.train_batch_sampler_config)
-            sampler_cfg.setdefault("params", {})
-            sampler_cfg["params"]["labeled_indices"] = labeled_idx
-            sampler_cfg["params"]["unlabeled_indices"] = unlabeled_idx
-            self._train_batch_sampler = instantiate_from_config(sampler_cfg)
+            if not unlabeled_idx:
+                # No unlabeled rows at all. With `unlabeled_pool_size` set this should not happen at
+                # any label budget -- the pool is drawn from frames that were never annotated, so it
+                # survives `label_fraction=1.0`. Reaching this branch therefore means the pool is
+                # off, and the batch composition silently stops being comparable across budgets:
+                # every row becomes a labelled row, so a step carries twice the supervised gradient
+                # of a two-stream step. Loud, because it invalidates the comparison rather than the
+                # run.
+                warnings.warn(
+                    "TwoStreamBatchSampler is configured but the training set has no unlabeled "
+                    "rows, so it was replaced by a plain DataLoader. Batches will be fully "
+                    "labelled and this run is NOT comparable to two-stream runs. Set "
+                    "`unlabeled_pool_size` on the dataset to keep a real unlabeled stream at every "
+                    "label budget.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                self._train_batch_sampler = None
+            else:
+                # A plain dict, never the DictConfig the YAML produced: OmegaConf validates every
+                # assigned value against its primitive types, so injecting numpy arrays raises, and
+                # even the index lists would be copied into a ListConfig element by element.
+                sampler_cfg = self.train_batch_sampler_config
+                if isinstance(sampler_cfg, DictConfig):
+                    sampler_cfg = OmegaConf.to_container(sampler_cfg, resolve=True)
+                else:
+                    sampler_cfg = copy.deepcopy(dict(sampler_cfg))
+
+                params = dict(sampler_cfg.get("params") or {})
+                params["labeled_indices"] = labeled_idx
+                params["unlabeled_indices"] = unlabeled_idx
+
+                # Video-conditioned unlabeled policies (`same_video`, `temporal_window`) need to know
+                # which rows share a video and how far apart they are. Injected only when the sampler
+                # declares the parameter, so a sampler that does not care is unaffected.
+                sampler_cls = get_obj_from_str(sampler_cfg["target"])
+                if "frame_metadata" in inspect.signature(sampler_cls).parameters:
+                    params["frame_metadata"] = frame_index_metadata(self.datasets["train"])
+
+                sampler_cfg["params"] = params
+                self._train_batch_sampler = instantiate_from_config(sampler_cfg)
 
     def _make_loader(self, split: str, shuffle: bool) -> DataLoader:
         if split not in self.datasets:

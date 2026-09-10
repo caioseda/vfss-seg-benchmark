@@ -26,6 +26,10 @@ def load_video_frame_dataframe(dataset_path: Union[str, Path], video_frame_table
     df = pd.read_csv(dataset_path / video_frame_table_filename)
     df['frame_id'] = df['frame_id'].astype(int)
     df['video_id'] = df['video_id'].astype(int)
+    # Every row of this table is an annotated frame. The distinction only becomes meaningful once
+    # `build_unlabeled_frame_pool` appends frames that have no ground truth at all -- which is not
+    # the same thing as a frame whose label `apply_label_regime` hides.
+    df['has_target'] = True
     assert df.shape[0] > 0, "The video frame DataFrame is empty. Please check the provided dataset_path and video_frame_table_filename."
     return df
 
@@ -178,6 +182,111 @@ def apply_label_regime(
     return df
 
 
+def build_unlabeled_frame_pool(
+    dataset_path: Union[str, Path],
+    annotated_df: pd.DataFrame,
+    splits: Sequence[str] = ("train",),
+    pool_size: Optional[int] = None,
+    frame_stride: int = 1,
+    seed: int = 42,
+    frame_extension: str = ".png",
+) -> pd.DataFrame:
+    '''
+    Build a DataFrame of video frames that were **never annotated**, to be used as the unlabeled
+    stream of semi-supervised training.
+
+    This is the difference between this dataset and the public benchmarks the semi-supervised
+    literature is built on. There, a fully annotated dataset is *simulated* into a low-label regime
+    by hiding labels, so "100% of the labels" means there is no unlabeled data left and every
+    semi-supervised method collapses onto its supervised baseline. Here the annotations are the
+    scarce resource (~1k annotated frames against ~46k frames on disk) and the unlabeled data is
+    real and abundant, so it belongs in *every* regime -- including 100% -- and the question the
+    experiment can answer becomes the useful one: what do the unannotated frames add on top of all
+    the annotation we have?
+
+    Frames are taken only from videos whose `split` is in `splits` (by default just `train`), so no
+    frame of a validation or test patient ever enters training -- the unlabeled pool is a leakage
+    surface exactly like the labeled data is.
+
+    Args:
+        dataset_path: dataset root; `image_path` values are resolved relative to it.
+        annotated_df: the annotated-frame table, already carrying a `split` column (i.e. after
+            `split_by_group`). Its rows supply the video-level metadata (patient, session, ...)
+            that pool frames inherit from the video they come from.
+        splits: splits whose videos may contribute unlabeled frames.
+        pool_size: cap on the number of frames returned, sampled uniformly without replacement using
+            `seed`. None keeps every eligible frame.
+        frame_stride: keep every `frame_stride`-th frame of each video. Consecutive VFSS frames are
+            nearly identical, so a stride buys diversity per unit of compute far more cheaply than a
+            larger `pool_size` does.
+        seed: seed of the sub-sampling, so a pool is reproducible and nested across runs.
+
+    Returns:
+        A DataFrame with the same columns as `annotated_df`, with `is_labeled=False`,
+        `has_target=False` and `target_path=NA` (these frames have no ground truth at all --
+        unlike a frame whose label is merely hidden by `apply_label_regime`).
+    '''
+    dataset_path = Path(dataset_path)
+    if "split" not in annotated_df.columns:
+        raise ValueError("`annotated_df` must already carry a 'split' column (call `split_by_group` first).")
+    if frame_stride < 1:
+        raise ValueError(f"frame_stride must be >= 1, got {frame_stride}")
+
+    eligible = annotated_df[annotated_df["split"].isin(tuple(splits))]
+    if eligible.empty:
+        raise ValueError(f"No annotated rows found for splits={tuple(splits)}; cannot locate the videos to pool from.")
+
+    annotated_keys = set(zip(eligible["video_id"].astype(int), eligible["frame_id"].astype(int)))
+
+    blocks = []
+    for video_id, video_rows in eligible.groupby("video_id", sort=True):
+        template = video_rows.iloc[0]
+        frames_dir = Path(os.path.dirname(template.image_path))
+        absolute_dir = dataset_path / frames_dir
+        if not absolute_dir.is_dir():
+            logger.warning(f"Frame directory not found for video {video_id}: {absolute_dir}. Skipping it.")
+            continue
+
+        frame_ids = sorted(
+            int(path.stem) for path in absolute_dir.glob(f"*{frame_extension}") if path.stem.isdigit()
+        )
+        frame_ids = [f for f in frame_ids if (int(video_id), f) not in annotated_keys]
+        if frame_stride > 1:
+            frame_ids = frame_ids[::frame_stride]
+        if not frame_ids:
+            continue
+
+        block = video_rows.iloc[[0] * len(frame_ids)].copy()
+        block["frame_id"] = frame_ids
+        block["video_frame"] = [f"v{int(video_id)}_f{frame_id}" for frame_id in frame_ids]
+        block["image_path"] = [str(frames_dir / f"{frame_id}{frame_extension}") for frame_id in frame_ids]
+        blocks.append(block)
+
+    if not blocks:
+        raise ValueError(
+            f"The unlabeled pool is empty: no unannotated {frame_extension} frames were found under "
+            f"{dataset_path} for splits={tuple(splits)}."
+        )
+
+    pool = pd.concat(blocks, ignore_index=True)
+    for column in ("target_path", "target_dir"):
+        if column in pool.columns:
+            pool[column] = pd.NA
+    pool["is_labeled"] = False
+    pool["has_target"] = False
+
+    if pool_size is not None and pool_size < len(pool):
+        rng = np.random.RandomState(seed)
+        selected = np.sort(rng.choice(len(pool), size=int(pool_size), replace=False))
+        pool = pool.iloc[selected].reset_index(drop=True)
+
+    logger.info(
+        f"Unlabeled pool: {len(pool)} frames from {pool.video_id.nunique()} videos "
+        f"(splits={tuple(splits)}, frame_stride={frame_stride}, pool_size={pool_size}, seed={seed})."
+    )
+    return pool
+
+
 class VFSSFrameDatasetBase(Dataset):
     '''
     Base class owning everything that is not specific to loading a window of frames:
@@ -210,7 +319,13 @@ class VFSSFrameDatasetBase(Dataset):
                  label_fraction: float = 1.0,
                  label_seed: int = 42,
                  label_group_column: str = "paciente_id",
-                 label_regime_splits: Sequence[str] = ("train",)):
+                 label_regime_splits: Sequence[str] = ("train",),
+                 use_unlabeled_pool: Optional[bool] = None,
+                 unlabeled_pool_size: Optional[int] = None,
+                 unlabeled_pool_frame_stride: int = 1,
+                 unlabeled_pool_seed: int = 42,
+                 unlabeled_pool_splits: Sequence[str] = ("train",),
+                 expose_hidden_targets: bool = False):
         '''
         Args:
             dataset_path (str | Path): Diretório raiz do dataset.
@@ -237,6 +352,28 @@ class VFSSFrameDatasetBase(Dataset):
             label_group_column (str): Coluna usada para agrupar frames ao aplicar o regime de rótulo (por padrão `paciente_id`).
             label_regime_splits (Sequence[str]): Splits sujeitos ao mascaramento de rótulo (por padrão só `('train',)`);
                 qualquer split fora dessa lista (ex: val/test) sempre mantém `is_labeled=True`.
+            use_unlabeled_pool (bool, optional): Liga/desliga o pool explicitamente. None (padrão)
+                infere de `unlabeled_pool_size is not None`. Passe True com `unlabeled_pool_size=None`
+                para um pool **sem teto** (todos os frames elegíveis) — sem esta flag, "sem teto" e
+                "sem pool" seriam a mesma coisa.
+            unlabeled_pool_size (int, optional): Teto do número de frames
+                **nunca anotados** (ver `build_unlabeled_frame_pool`), amostrados dos vídeos de
+                `unlabeled_pool_splits`. Diferentemente dos frames com rótulo escondido por
+                `label_fraction`, esses frames existem em qualquer orçamento de anotação — inclusive
+                em `label_fraction=1.0` — e são o fluxo não supervisionado real do dataset.
+                None significa **sem teto** quando `use_unlabeled_pool=True`, e desliga o pool
+                quando `use_unlabeled_pool` é None (comportamento histórico: só frames anotados).
+            unlabeled_pool_frame_stride (int): Mantém 1 a cada N frames de cada vídeo no pool. Frames
+                consecutivos de VFSS são quase idênticos; o stride compra diversidade mais barato que
+                um pool maior.
+            unlabeled_pool_seed (int): Seed da amostragem do pool.
+            unlabeled_pool_splits (Sequence[str]): Splits cujos vídeos podem contribuir frames não
+                anotados (por padrão só `train`, para não vazar pacientes de val/test).
+            expose_hidden_targets (bool): Se True, cada amostra também carrega `hidden_segmentation`
+                e `metadata['has_hidden_target']` — a ground truth que o regime de rótulo escondeu.
+                Serve **apenas para diagnóstico** (medir a qualidade do pseudo-rótulo durante o
+                treino); nenhuma loss deve lê-la. Frames do pool não têm anotação alguma e vêm com
+                `has_hidden_target=False`.
         '''
 
         self.dataset_path = Path(dataset_path)
@@ -284,6 +421,33 @@ class VFSSFrameDatasetBase(Dataset):
             label_regime_splits=self.label_regime_splits,
         )
 
+        # The unlabeled pool is appended *after* the label regime: `label_fraction` is a fraction of
+        # the annotated frames, and these frames were never annotated, so they are outside its
+        # accounting entirely. That is what keeps an unsupervised stream available at every budget,
+        # `label_fraction=1.0` included.
+        self.unlabeled_pool_size = unlabeled_pool_size
+        self.unlabeled_pool_frame_stride = unlabeled_pool_frame_stride
+        self.unlabeled_pool_seed = unlabeled_pool_seed
+        self.unlabeled_pool_splits = tuple(unlabeled_pool_splits)
+        # `unlabeled_pool_size` is a *cap*, and None means "no cap" -- which is not the same as "no
+        # pool". Without this second knob the two would collide and an uncapped pool would silently
+        # become no pool at all.
+        self.use_unlabeled_pool = (
+            unlabeled_pool_size is not None if use_unlabeled_pool is None else bool(use_unlabeled_pool)
+        )
+        if self.use_unlabeled_pool:
+            pool_df = build_unlabeled_frame_pool(
+                self.dataset_path,
+                self.video_frame_df,
+                splits=self.unlabeled_pool_splits,
+                pool_size=unlabeled_pool_size,
+                frame_stride=unlabeled_pool_frame_stride,
+                seed=unlabeled_pool_seed,
+            )
+            self.video_frame_df = pd.concat([self.video_frame_df, pool_df], ignore_index=True)
+
+        self.expose_hidden_targets = expose_hidden_targets
+
         if split is not None:
             if split not in SPLIT_NAMES:
                 raise ValueError(f"split must be one of {SPLIT_NAMES}, got '{split}'")
@@ -295,6 +459,7 @@ class VFSSFrameDatasetBase(Dataset):
             "Please check the provided dataset_path, split and split_mode."
         )
 
+        self._total_frames_cache = {}
         self.image_size = (size, size)
         self.return_metadata = return_metadata
         self.repeat_channels = repeat_channels
@@ -402,12 +567,20 @@ class VFSSFrameDatasetBase(Dataset):
 
     def get_total_frames_in_video(self, video_id: Union[str, int], filetype='.png'):
         ''' Get the total number of frames in a video based on the video_id '''
+        # Memoised: this is called once per `__getitem__` and each call is an `os.listdir` of a
+        # directory holding every frame of the video. Harmless at ~1k annotated samples, a real cost
+        # once the unlabeled pool multiplies the dataset by ~50.
+        cache_key = (int(video_id), filetype)
+        if cache_key in self._total_frames_cache:
+            return self._total_frames_cache[cache_key]
+
         video_frame_row = self.video_frame_df[self.video_frame_df.video_id == video_id].iloc[0]
         image_folder_path = os.path.dirname(video_frame_row.image_path)
         image_folder_path = self._resolve_path(image_folder_path)
 
         frame_files = [f for f in os.listdir(image_folder_path) if f.endswith(filetype)]
         total_frames = len(frame_files)
+        self._total_frames_cache[cache_key] = total_frames
         return total_frames
 
     def _preprocess_image(self, image: torch.Tensor):
@@ -492,6 +665,9 @@ class VFSSFrameDatasetBase(Dataset):
             'target_variant': row.target_variant,
             'split': row.split,
             'is_labeled': bool(row.is_labeled),
+            # `is_labeled=False, has_target=True`  -> annotated frame, label hidden by the regime.
+            # `is_labeled=False, has_target=False` -> frame from the unlabeled pool, never annotated.
+            'has_target': bool(row.get('has_target', True)),
         }
         for optional_column in ('paciente_id', 'momento', 'procedimento'):
             if optional_column in self.video_frame_df.columns:
@@ -644,6 +820,7 @@ class VFSSWindowImageDataset(VFSSFrameDatasetBase):
         )
         frames = self._preprocess_image(frames)
 
+        has_target = bool(row.get('has_target', True))
         if row.is_labeled:
             gt_mask = self._load_mask_from_path(row.target_path)
             gt_mask = self._preprocess_mask(gt_mask)
@@ -662,6 +839,18 @@ class VFSSWindowImageDataset(VFSSFrameDatasetBase):
         returns['image'] = frames
         returns['segmentation'] = gt_mask
         returns['metadata'] = metadata
+
+        if self.expose_hidden_targets:
+            # Diagnostics only -- see `expose_hidden_targets`. The key is always present (collation
+            # needs a consistent schema); `has_hidden_target` says whether it means anything.
+            if has_target and not row.is_labeled:
+                hidden = self._preprocess_mask(self._load_mask_from_path(row.target_path))
+            elif has_target:
+                hidden = gt_mask
+            else:
+                hidden = torch.zeros(self.image_size, dtype=torch.long)
+            returns['hidden_segmentation'] = hidden
+            metadata['has_hidden_target'] = has_target
 
         return returns
 

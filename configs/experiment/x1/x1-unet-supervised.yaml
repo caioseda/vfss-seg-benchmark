@@ -1,0 +1,112 @@
+# Experimento X1 -- gate de margem para semi-supervisao.
+# O notebook notebooks/hyphotesis_testing/experiment_1_does_ssl_helps.ipynb sobrescreve
+# `name` e `data.params.shared_dataset_params.label_fraction` para varrer os orcamentos.
+name: x1-unet-supervised
+type: experiment
+
+model:
+  target: src.models.unet.UNet
+  params:
+    n_channels: 3
+    n_classes: 4  # 0=fundo, 1=C2, 2=C3 (ausente nesta variante), 3=C4
+    bilinear: True
+
+lit_module:
+  target: src.models.ssl.supervised.SupervisedLitWrapper
+  params:
+    report_class_ids: {1: C2, 3: C4}   # C3 nunca aparece; incluir na media derruba todo agregado
+    surface_metric_stages: [test]      # ASSD/HD95 custam ~1000x IoU -- so no teste
+    # Sem termo de consistencia: o cronograma e inerte aqui, mas a composicao do batch
+    # (4 rotulados + 4 nao rotulados) e identica a dos metodos SSL -- e o que isola o
+    # efeito da supervisao na comparacao.
+
+
+optimizer:
+  target: torch.optim.AdamW
+  params:
+    lr: 1e-3
+    weight_decay: 1e-4
+
+lr_scheduler:
+  target: torch.optim.lr_scheduler.CosineAnnealingLR
+  params:
+    T_max: 8000
+    eta_min: 1e-6
+  interval: step
+
+trainer:
+  params:
+    # Orcamento de compute FIXO em passos, nao em epocas: com o TwoStreamBatchSampler a "epoca" e
+    # len(rotulados)//labeled_batch_size, que encolhe conforme o orcamento de anotacao.
+    # Passos fixos => todo run ve o mesmo numero de imagens.
+    # max_steps tambem ancora o cronograma de consistencia (consistency_*_fraction).
+    max_steps: 8000
+    max_epochs: -1
+    accelerator: auto
+    devices: auto
+    check_val_every_n_epoch: 5   # ajustado por orcamento pelo runner do notebook
+    accumulate_grad_batches: 1
+  checkpoint:
+    monitor: val/dice_score
+    mode: max
+    save_top_k: 1
+    filename: 'best-{epoch}-{step}'
+  callbacks:
+    - target: src.callbacks.PrintDeviceCallback
+
+data:
+  target: src.data.base.DataModuleFromConfig
+  params:
+    batch_size: 8
+    num_workers: 8
+    wrap: False
+    shared_dataset_params:
+      dataset_path: /data_ssd/caioseda/data/dataset_inca_all_frames/
+      size: 256
+      window_size: 1
+      stride: 1
+      repeat_channels: True
+      mask_interpolation: nearest
+      target_variant: 'multiclass_c2_c4'
+      # O fold unico do X1: fixo em todos os runs, para que a comparacao seja entre orcamentos
+      # de rotulo e nao entre splits.
+      split_mode: seed
+      split_seed: 42
+      split_ratios: [0.7, 0.1, 0.2]
+      split_group_column: paciente_id
+      # label_seed FIXO garante o aninhamento entre orcamentos: revelados(10%) subset revelados(20%) ...
+      label_group_column: paciente_id
+      label_seed: 42
+      label_fraction: 1.0   # sobrescrito pelo notebook
+      # --- Pool nao rotulado REAL -------------------------------------------------------------
+      # ~961 frames anotados contra ~46k frames em disco: aqui o rotulo e que e escasso, nao os
+      # dados. Diferente da literatura de SSL (que simula poucos rotulos escondendo rotulos de um
+      # dataset totalmente anotado), o fluxo nao supervisionado vem de frames NUNCA anotados e
+      # existe em TODOS os orcamentos -- inclusive em label_fraction=1.0. E o que torna a pergunta
+      # do X1 a pergunta util: quanto os frames nao anotados somam sobre toda a anotacao que temos.
+      unlabeled_pool_size: 8000
+      unlabeled_pool_frame_stride: 3   # frames consecutivos de VFSS sao quase identicos
+      unlabeled_pool_seed: 42
+      unlabeled_pool_splits: [train]   # nenhum frame de paciente de val/test entra no treino
+      # Diagnostico: expoe a GT que o regime escondeu para medir a qualidade do pseudo-rotulo
+      # durante o treino. Nenhuma loss le esse tensor.
+      expose_hidden_targets: True
+    train_batch_sampler:
+      target: src.data.samplers.TwoStreamBatchSampler
+      params:
+        batch_size: 8
+        labeled_batch_size: 4
+        seed: 42
+        # Politica DEFAULT do X1: cada frame nao rotulado do batch vem do MESMO VIDEO de um dos
+        # frames rotulados daquele batch, em qualquer posicao. Preserva a estrutura real do dataset
+        # (video, nao colecao de fatias independentes), que e o cenario em que os metodos devem ser
+        # avaliados aqui. O efeito desta escolha e o objeto do experimento X1B
+        # (notebooks/hyphotesis_testing/experiment_1b_unlabeled_sampling_policy.ipynb), que compara
+        # esta politica com amostragem global e com janelas temporais.
+        unlabeled_policy: same_video
+    train:
+      target: src.data.vfss_frame_dataset.VFSSIncaTrain
+    validation:
+      target: src.data.vfss_frame_dataset.VFSSIncaVal
+    test:
+      target: src.data.vfss_frame_dataset.VFSSIncaTest
