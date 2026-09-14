@@ -172,11 +172,26 @@ class LitWrapper(pl.LightningModule):
         *_, y_pred, y = self.shared_step(batch, batch_idx, stage="predict")
         return y_pred, y
 
+    def optimizer_param_groups(self):
+        '''
+        The parameters handed to the optimizer.
+
+        Load-bearing by omission: `MeanTeacherLitWrapper.teacher` is an EMA copy, not a trained
+        module, and it stays out of the optimizer precisely because this returns
+        `self.model.parameters()` and nothing else (pinned by
+        `tests/test_ssl_methods.py::TestMeanTeacher.test_teacher_is_not_in_the_optimizer`).
+
+        A subclass that owns *additional trainable* modules -- `DiffRectLitWrapper.rectifier` --
+        must override this. Forgetting to is a bug that runs perfectly: the module is built,
+        forwarded, checkpointed, and never updated.
+        '''
+        return self.model.parameters()
+
     def configure_optimizers(self):
         optimizer_cls = get_obj_from_str(self.optimizer_cfg["target"])
         optimizer_params = self.optimizer_cfg.get("params", {})
         optimizer = optimizer_cls(
-            self.model.parameters(), **optimizer_params
+            self.optimizer_param_groups(), **optimizer_params
         )
         if self.lr_scheduler_cfg is None:
             return optimizer

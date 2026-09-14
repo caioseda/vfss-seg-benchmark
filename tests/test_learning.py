@@ -17,14 +17,31 @@ from unittest import mock
 
 import torch
 
-from src.models.ssl import FixMatchLitWrapper, MeanTeacherLitWrapper, SupervisedLitWrapper
-from tests.helpers import TINY_MODEL_CFG, make_batch
+from src.models.ssl import (
+    DiffRectLitWrapper,
+    FixMatchLitWrapper,
+    MeanTeacherLitWrapper,
+    SupervisedLitWrapper,
+)
+from tests.helpers import DIFFRECT_KWARGS, DIFFRECT_MIN_SIZE, TINY_MODEL_CFG, make_batch
+
+# DiffRect trains a second, much larger network per step and its rectifier needs >= 64px inputs,
+# so it gets a shorter loop on a smaller batch. It is included here at all because its
+# `training_step` returns a real loss -- which is only true because of the fused-backward design
+# (manual optimization would return None and drop out of this suite entirely).
+DIFFRECT_STEPS = 120
 
 # Adam, not the SGD of `tests.helpers.OPTIMIZER_CFG`: with SGD(lr=0.1) this net needs ~1000 steps to
 # memorise the batch, which would make the suite needlessly slow. The point is to prove the training
 # loop optimises, not to benchmark the optimiser.
 OVERFIT_OPTIMIZER_CFG = {"target": "torch.optim.Adam", "params": {"lr": 0.01}}
 STEPS = 300
+
+
+def at_step(module, step: int):
+    '''Pin `global_step`, which is otherwise driven by a Trainer that these tests do not create.'''
+    return mock.patch.object(type(module), "global_step",
+                             new_callable=mock.PropertyMock, return_value=step)
 
 
 def overfit(wrapper_cls, batch, steps: int = STEPS, **kwargs):
@@ -40,8 +57,7 @@ def overfit(wrapper_cls, batch, steps: int = STEPS, **kwargs):
 
     losses = []
     for step in range(steps):
-        with mock.patch.object(type(module), "global_step",
-                               new_callable=mock.PropertyMock, return_value=step):
+        with at_step(module, step):
             optimizer.zero_grad()
             loss = module.training_step(batch, 0)
             loss.backward()
@@ -74,16 +90,99 @@ class TestCanOverfit(unittest.TestCase):
                 self.assertGreater(dice, 0.9,
                                    f"{name}: could not memorise 3 frames (Dice {dice:.3f})")
 
+    def test_diffrect_leaves_the_segmentation_path_untouched(self):
+        '''
+        The invariant the fused-backward design rests on, stated as an *equality* rather than a
+        threshold: with the unsupervised machinery off, DiffRect must train the segmentation network
+        **bit-identically** to `SupervisedLitWrapper`.
+
+        DiffRect adds a second network, four loss terms and a diffusion sampler to a single fused
+        backward. If any of that leaked gradient into the segmentation network -- an undetached
+        pseudo-label, a rectifier tensor still attached to the segmentation graph, the two param
+        groups crossed -- the two runs would diverge. They do not, and that is checkable exactly,
+        with no tolerance to tune.
+
+        Why this replaced a "reaches at least 0.4x the supervised Dice" check: on this fixture that
+        criterion measures the fixture, not the method. `TinyNet` is two convolutions (5x5 receptive
+        field) and cannot memorise 64x64 inputs at any step budget this suite can afford, so the
+        supervised baseline itself only reaches ~0.07 Dice. Against that floor, *every* consistency
+        method degrades -- Mean Teacher reaches exactly 0.0 here, and FixMatch only ties the baseline
+        because its 0.95 threshold keeps its unsupervised term at exactly zero throughout. A
+        pseudo-label term trained against noise is *supposed* to hurt when the pseudo-labels are
+        noise; that is not a defect to assert against.
+        '''
+        batch = make_batch(n_labeled=3, n_unlabeled=1, size=DIFFRECT_MIN_SIZE)
+        common = dict(steps=DIFFRECT_STEPS, consistency_rampup_steps=DIFFRECT_STEPS,
+                      consistency_weight=0.0)
+
+        _, _, baseline_dice = overfit(SupervisedLitWrapper, batch, **common)
+        _, _, dice = overfit(
+            DiffRectLitWrapper, batch, total_steps=DIFFRECT_STEPS, supervise_weak_view=False,
+            # Both halves of the unsupervised path off: consistency weight 0 above, and the
+            # rectified pseudo-label never switched on. What is left is the supervised term alone.
+            rectification_start_steps=DIFFRECT_STEPS + 1, **common, **DIFFRECT_KWARGS,
+        )
+        self.assertGreater(baseline_dice, 0.0, "the supervised baseline itself learned nothing; "
+                                               "this fixture cannot support the comparison")
+        self.assertAlmostEqual(
+            dice, baseline_dice, places=6,
+            msg=f"diffrect reached Dice {dice:.6f} where the same net trained supervised on the "
+                f"same batch reached {baseline_dice:.6f}. With the consistency weight at 0 and the "
+                f"rectification feedback off these must be identical -- a difference means the "
+                f"rectifier or one of the extra loss terms is leaking gradient into the "
+                f"segmentation network.",
+        )
+
+    def test_diffrect_rectifier_actually_trains(self):
+        '''
+        The other half: the rectifier is disjoint from the segmentation network, so *nothing in the
+        segmentation metrics can tell us whether it trains at all*. A rectifier whose latent loss
+        never moves would leave every test above green while making DiffRect an expensive FixMatch.
+
+        Pinned on the latent MSE, which is the LFR's own objective (`L_Lat-U` / `L_Lat-L`).
+        '''
+        batch = make_batch(n_labeled=3, n_unlabeled=1, size=DIFFRECT_MIN_SIZE)
+        torch.manual_seed(0)
+        module = DiffRectLitWrapper(
+            model_cfg=TINY_MODEL_CFG, optimizer_cfg=OVERFIT_OPTIMIZER_CFG,
+            report_class_ids={1: "C2", 3: "C4"}, consistency_warmup_steps=0,
+            consistency_rampup_steps=DIFFRECT_STEPS, total_steps=DIFFRECT_STEPS,
+            **DIFFRECT_KWARGS,
+        )
+        latent_losses = []
+        module.log = lambda *a, **k: None
+        module.log_dict = lambda logs, *a, **k: latent_losses.append(
+            float(logs["train/latent_loss"]))
+        optimizer = module.configure_optimizers()
+        for step in range(DIFFRECT_STEPS):
+            with at_step(module, step):
+                optimizer.zero_grad()
+                loss = module.training_step(batch, 0)
+                loss.backward()
+                optimizer.step()
+
+        self.assertTrue(latent_losses, "the module never logged train/latent_loss")
+        first = sum(latent_losses[:10]) / len(latent_losses[:10])
+        last = sum(latent_losses[-10:]) / len(latent_losses[-10:])
+        self.assertLess(last, 0.9 * first,
+                        f"the rectifier's latent loss barely moved ({first:.4f} -> {last:.4f}); "
+                        f"the LFR is not learning and DiffRect degenerates to FixMatch with "
+                        f"extra cost")
+
     def test_loss_is_finite_throughout(self):
         '''NaN/inf from the Dice smoothing or an empty confidence mask would poison training silently.'''
-        batch = make_batch(n_labeled=2, n_unlabeled=2, size=16)
         for name, wrapper_cls in [("meanteacher", MeanTeacherLitWrapper),
-                                  ("fixmatch", FixMatchLitWrapper)]:
+                                  ("fixmatch", FixMatchLitWrapper),
+                                  ("diffrect", DiffRectLitWrapper)]:
             with self.subTest(method=name):
+                is_diffrect = wrapper_cls is DiffRectLitWrapper
+                batch = make_batch(n_labeled=2, n_unlabeled=2,
+                                   size=DIFFRECT_MIN_SIZE if is_diffrect else 16)
                 torch.manual_seed(0)
                 module = wrapper_cls(model_cfg=TINY_MODEL_CFG, optimizer_cfg=OVERFIT_OPTIMIZER_CFG,
                                      report_class_ids={1: "C2", 3: "C4"},
-                                     consistency_warmup_steps=0, consistency_rampup_steps=40)
+                                     consistency_warmup_steps=0, consistency_rampup_steps=40,
+                                     **({**DIFFRECT_KWARGS, "total_steps": 40} if is_diffrect else {}))
                 module.log = lambda *a, **k: None
                 module.log_dict = lambda *a, **k: None
                 optimizer = module.configure_optimizers()

@@ -1,0 +1,121 @@
+# Reproducao no ACDC -- TESTE DE ACEITACAO do port do DiffRect.
+#
+# Nada no pipeline VFSS distingue "port quebrado" de "DiffRect nao ajuda no VFSS". Este config
+# existe para produzir um numero que ja tem gabarito publicado (Liu, Li & Yuan, MICCAI 2024,
+# arXiv:2407.09918, Tabela 1, conjunto de validacao):
+#
+#     rotulos |  Dice |   Jac | HD95  |  ASD
+#          1% | 82.40 | 71.96 | 10.04 | 2.90
+#          5% | 86.95 | 78.08 |  4.07 | 1.23
+#         10% | 90.18 | 82.72 |  1.38 | 0.48
+#   supervis. | 91.48 | 84.87 |  1.12 | 0.34   (100% dos rotulos)
+#
+# Ao contrario dos configs do X1, aqui os hiperparametros seguem a REFERENCIA e nao a convencao
+# deste repo: SGD 0.01 com decaimento polinomial 0.9 e 30k iteracoes, batch 6 com 3 rotulados,
+# patch 256. O X1 fixa AdamW/cosine/8000 porque la o que importa e comparabilidade ENTRE metodos;
+# aqui o que importa e comparabilidade com um numero publicado.
+#
+# O notebook notebooks/hyphotesis_testing/experiment_acdc_ssl_reproduction.ipynb sobrescreve
+# `name` e `data.params.shared_dataset_params.labeled_patients` para varrer os orcamentos.
+name: acdc-unet-supervised
+type: experiment
+
+model:
+  # DEFAULT = a UNet da REFERENCIA (SSL4MIS/DiffRect), 1.81M parametros com dropout ate 0.5.
+  # A src.models.unet.UNet deste repo tem 17.26M e nenhum dropout -- 9.5x maior. Comparar contra um
+  # numero publicado trocando o backbone em silencio nao seria reproducao. O notebook varre as duas
+  # como ablacao; ver src/third_party/ssl4mis/unet.py.
+  target: src.third_party.ssl4mis.SSL4MISUNet
+  params:
+    n_channels: 1        # ACDC e MRI de 1 canal (o VFSS usa 3 por repeat_channels)
+    n_classes: 4         # 0=fundo, 1=VD, 2=miocardio, 3=VE
+
+lit_module:
+  target: src.models.ssl.supervised.SupervisedLitWrapper
+  params:
+    report_class_ids: {1: RV, 2: Myo, 3: LV}   # as tres classes existem de fato no ACDC
+    surface_metric_stages: []   # as distancias de superficie que valem sao VOLUMETRICAS,
+                                # calculadas pelo callback e pelo notebook -- nao por fatia
+    log_pseudo_label_quality: True
+
+optimizer:
+  # SGD da referencia, nao o AdamW do X1.
+  target: torch.optim.SGD
+  params:
+    lr: 0.01
+    momentum: 0.9
+    weight_decay: 0.0001
+
+lr_scheduler:
+  # `base_lr * (1 - iter/max_iter) ** 0.9`, o poly decay da referencia. PolynomialLR do torch 2.4
+  # telescopa exatamente para essa formula, entao nao ha scheduler custom.
+  target: torch.optim.lr_scheduler.PolynomialLR
+  params:
+    total_iters: 30000
+    power: 0.9
+  interval: step
+
+trainer:
+  params:
+    max_steps: 30000
+    max_epochs: -1
+    accelerator: auto
+    devices: auto
+    # Com 1% dos rotulos uma "epoca" e 32//3 = 10 batches, entao o numero de epocas varia com o
+    # orcamento. O notebook fixa o intervalo de validacao em PASSOS convertendo aqui.
+    check_val_every_n_epoch: 20
+    accumulate_grad_batches: 1
+  checkpoint:
+    # A referencia seleciona pelo Dice VOLUMETRICO de validacao, nao pelo de fatia. Quem produz
+    # esta chave e o callback VolumetricValidation abaixo.
+    monitor: val/dice_volume
+    mode: max
+    save_top_k: 1
+    filename: 'best-{epoch}-{step}'
+  callbacks:
+    - target: src.callbacks.PrintDeviceCallback
+    - target: src.callbacks.VolumetricValidation
+      params:
+        num_classes: 4
+        class_ids: {1: RV, 2: Myo, 3: LV}
+        size: 256
+        surface_metrics: False   # caro; a passada final do notebook liga
+        dataset:
+          target: src.data.acdc_dataset.ACDCValVolumes
+          params:
+            root: /data_ssd/caioseda/data/ACDC
+            image_channels: 1
+
+data:
+  target: src.data.base.DataModuleFromConfig
+  params:
+    batch_size: 6          # referencia: 6, com 3 rotulados
+    num_workers: 0         # ACDC cabe em RAM e sao ~3.000 "epocas": respawn de worker dominaria
+    wrap: False
+    shared_dataset_params:
+      root: /data_ssd/caioseda/data/ACDC
+      size: 256
+      image_channels: 1
+      # Diagnostico de qualidade de pseudo-rotulo. No ACDC sai de graca: o dataset e totalmente
+      # anotado, entao a GT "escondida" existe para toda linha nao rotulada. Nenhuma loss le isso.
+      expose_hidden_targets: True
+    train:
+      target: src.data.acdc_dataset.ACDCTrain
+      params:
+        # 1%=1 paciente (32 fatias), 5%=7 (136), 10%=14 (256). Sobrescrito pelo notebook.
+        labeled_patients: 7
+    validation:
+      target: src.data.acdc_dataset.ACDCVal
+    test:
+      # FATIAS, nao volumes: Experiment.run sempre chama trainer.test(), e LitWrapper.shared_step
+      # quebraria com um tensor 5-D. Os numeros volumetricos do teste saem do notebook.
+      target: src.data.acdc_dataset.ACDCTest
+    train_batch_sampler:
+      target: src.data.samplers.TwoStreamBatchSampler
+      params:
+        batch_size: 6
+        labeled_batch_size: 3
+        seed: 1337        # semente da referencia
+        # ACDC e um conjunto de fatias independentes, nao videos: a politica do X1 (same_video)
+        # nao se aplica e a referencia amostra globalmente.
+        unlabeled_policy: global

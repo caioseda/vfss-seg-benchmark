@@ -23,7 +23,7 @@ from torch import Tensor
 import torchvision.transforms.v2.functional as TF
 from torchvision.transforms import InterpolationMode
 
-from typing import Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 # Weak-augmentation geometry, matching the mild policy used by 2D semi-supervised segmentation
 # baselines (random flip + small affine); strong enough to decorrelate the two views, small enough
@@ -52,6 +52,75 @@ def _to_signed(image: Tensor) -> Tensor:
     return image * 2.0 - 1.0
 
 
+def weak_augment_multi(
+    image: Tensor,
+    masks: Sequence[Optional[Tensor]],
+    generator: Optional[torch.Generator] = None,
+) -> Tuple[Tensor, List[Optional[Tensor]]]:
+    '''
+    `weak_augment` for **several masks under one draw**.
+
+    DiffRect needs the supervised target *and* the hidden diagnostic target warped by the same
+    geometry as the image; calling `weak_augment` twice would draw two different transforms and
+    silently misalign the pseudo-label quality curves from the loss.
+
+    The random draws (flip, angle, dx, dy, scale) are consumed in a fixed order that does not
+    depend on how many masks are passed, so for a given seeded `generator` this produces exactly
+    the same image as `weak_augment` with zero or one mask -- pinned by
+    `tests/test_ssl_methods.py::TestWeakAugmentMulti`.
+
+    Args:
+        image: `[B, C, H, W]` in [-1, 1].
+        masks: sequence of optional `[B, H, W]` class-index tensors. `None` entries pass through
+            as `None`, so a caller can hand over an absent diagnostic target without branching.
+
+    Returns:
+        `(augmented_image, [augmented_mask, ...])`, positionally aligned with `masks`.
+    '''
+    device = image.device
+    images: List[Tensor] = []
+    warped: List[List[Tensor]] = [[] for _ in masks]
+
+    for i in range(image.shape[0]):
+        img_i = image[i]
+        # Masks are transformed as [1, H, W] so torchvision treats them as an image, then squeezed back.
+        masks_i = [m[i].unsqueeze(0).float() if m is not None else None for m in masks]
+
+        if _rand(generator, device) < WEAK_FLIP_PROB:
+            img_i = TF.hflip(img_i)
+            masks_i = [TF.hflip(m) if m is not None else None for m in masks_i]
+
+        angle = _uniform(-WEAK_MAX_ROTATION_DEG, WEAK_MAX_ROTATION_DEG, generator, device)
+        max_dx = WEAK_MAX_TRANSLATE * img_i.shape[-1]
+        max_dy = WEAK_MAX_TRANSLATE * img_i.shape[-2]
+        translate = [
+            int(round(_uniform(-max_dx, max_dx, generator, device))),
+            int(round(_uniform(-max_dy, max_dy, generator, device))),
+        ]
+        scale = _uniform(*WEAK_SCALE_RANGE, generator=generator, device=device)
+
+        img_i = TF.affine(
+            img_i, angle=angle, translate=translate, scale=scale, shear=[0.0, 0.0],
+            interpolation=InterpolationMode.BILINEAR, fill=[-1.0],
+        )
+        for slot, mask_i in enumerate(masks_i):
+            if mask_i is None:
+                continue
+            warped[slot].append(TF.affine(
+                mask_i, angle=angle, translate=translate, scale=scale, shear=[0.0, 0.0],
+                interpolation=InterpolationMode.NEAREST, fill=[0.0],
+            ).squeeze(0).long())
+
+        images.append(img_i)
+
+    out_image = torch.stack(images, dim=0)
+    out_masks = [
+        torch.stack(rows, dim=0) if mask is not None else None
+        for mask, rows in zip(masks, warped)
+    ]
+    return out_image, out_masks
+
+
 def weak_augment(
     image: Tensor,
     mask: Optional[Tensor] = None,
@@ -68,45 +137,8 @@ def weak_augment(
     Returns:
         `(augmented_image, augmented_mask)`; the mask is None if none was given.
     '''
-    device = image.device
-    images, masks = [], []
-
-    for i in range(image.shape[0]):
-        img_i = image[i]
-        # Masks are transformed as [1, H, W] so torchvision treats them as an image, then squeezed back.
-        mask_i = mask[i].unsqueeze(0).float() if mask is not None else None
-
-        if _rand(generator, device) < WEAK_FLIP_PROB:
-            img_i = TF.hflip(img_i)
-            if mask_i is not None:
-                mask_i = TF.hflip(mask_i)
-
-        angle = _uniform(-WEAK_MAX_ROTATION_DEG, WEAK_MAX_ROTATION_DEG, generator, device)
-        max_dx = WEAK_MAX_TRANSLATE * img_i.shape[-1]
-        max_dy = WEAK_MAX_TRANSLATE * img_i.shape[-2]
-        translate = [
-            int(round(_uniform(-max_dx, max_dx, generator, device))),
-            int(round(_uniform(-max_dy, max_dy, generator, device))),
-        ]
-        scale = _uniform(*WEAK_SCALE_RANGE, generator=generator, device=device)
-
-        img_i = TF.affine(
-            img_i, angle=angle, translate=translate, scale=scale, shear=[0.0, 0.0],
-            interpolation=InterpolationMode.BILINEAR, fill=[-1.0],
-        )
-        if mask_i is not None:
-            mask_i = TF.affine(
-                mask_i, angle=angle, translate=translate, scale=scale, shear=[0.0, 0.0],
-                interpolation=InterpolationMode.NEAREST, fill=[0.0],
-            )
-
-        images.append(img_i)
-        if mask_i is not None:
-            masks.append(mask_i.squeeze(0).long())
-
-    out_image = torch.stack(images, dim=0)
-    out_mask = torch.stack(masks, dim=0) if mask is not None else None
-    return out_image, out_mask
+    out_image, out_masks = weak_augment_multi(image, [mask], generator=generator)
+    return out_image, out_masks[0]
 
 
 def strong_augment(

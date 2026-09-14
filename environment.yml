@@ -30,3 +30,6 @@ dependencies:
     - protobuf==3.20.*
     - pytz 
     - timm==1.0.25
+    # Only needed to PREPARE the ACDC reproduction data (scripts/prepare_acdc.py reads .nii.gz).
+    # Training and evaluation never import it.
+    - nibabel

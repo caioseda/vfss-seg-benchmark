@@ -16,7 +16,39 @@ lit_module:
   params:
     report_class_ids: {1: C2, 3: C4}   # C3 nunca aparece; incluir na media derruba todo agregado
     surface_metric_stages: [test]      # ASSD/HD95 custam ~1000x IoU -- so no teste
-    # Fase 2 -- ver src/models/ssl/diffrect.py
+
+    # --- Base semi-supervisionada -------------------------------------------------------------
+    # 'reference' = o L_Semi que o DiffRect realmente publicou (normalizacao min-max + limiar 0.8 +
+    # complementary loss ponderada por entropia), necessario para os numeros do ACDC reproduzirem.
+    # 'canonical' usa o objetivo do FixMatchLitWrapper deste repo; nesse modo DiffRect e FixMatch
+    # diferem em exatamente UMA coisa (o modulo de retificacao), o que torna a celula X1 uma
+    # leitura limpa do modulo sozinho. Ver src/models/ssl/diffrect.py.
+    semi_supervised_base: reference
+    confidence_threshold: 0.8          # limiar da REFERENCIA (o FixMatch canonico usa 0.95)
+    complementary_loss: True
+    cutout_prob: 0.0                   # a perturbacao forte da referencia e so fotometrica
+    # A referencia supervisiona a view fracamente aumentada; os outros tres metodos do X1
+    # supervisionam a imagem crua. Manter True e fiel ao artigo; False isola melhor a comparacao.
+    supervise_weak_view: True
+
+    # --- Retificador latente ------------------------------------------------------------------
+    # Defaults reproduzem a referencia (latente H/16 x W/16 x 256, cosine, T=10, 2 passos de DDIM).
+    # ATENCAO ao orcamento: o retificador e um modelo de difusao treinado do ZERO. Aqui ele tem
+    # ~7.700 passos pos-warmup contra ~29.000 na referencia. Uma celula X1 fraca pode ser artefato
+    # de orcamento e nao do metodo -- conferir train/latent_loss e o gap entre
+    # train/rectified_dice e train/pseudo_dice ANTES de concluir qualquer coisa.
+    latent_channels: 256
+    rectifier_timesteps: 10
+    rectifier_sample_steps: 2
+    rectifier_beta_schedule: cosine
+    condition_on_image: True           # o que o CODIGO da referencia faz (o texto do artigo sugere False)
+    rectification_start_fraction: 0.0333   # 1000/30000 na referencia, como fracao do orcamento
+
+    # --- Cronograma de consistencia (identico ao do FixMatch/MeanTeacher) ----------------------
+    consistency_weight: 0.1
+    consistency_rampup_fraction: 1.0
+    consistency_warmup_fraction: 0.0333
+    log_pseudo_label_quality: True     # exige expose_hidden_targets no dataset
 
 optimizer:
   target: torch.optim.AdamW

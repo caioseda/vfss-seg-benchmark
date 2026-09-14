@@ -36,7 +36,11 @@ Esta seção existe para que nenhum termo do documento fique sem definição. El
 
 **Janela e passo temporal.** Janela é o conjunto de frames vizinhos considerados em torno de um frame alvo. Passo é a distância, em número de frames, entre o frame alvo e o vizinho escolhido. Neste documento, essa distância é chamada `g`.
 
-**Retificação latente do DiffRect.** O módulo do DiffRect que aprende a corrigir pseudo-rótulos. Conforme já levantado neste projeto, ele opera sobre a representação comprimida do **rótulo**, sem olhar para a imagem. Essa propriedade importa em duas hipóteses adiante, porque significa que a correção não pode usar evidência visual para desfazer um erro de posição ou de identidade.
+**Retificação latente do DiffRect.** O módulo do DiffRect que aprende a corrigir pseudo-rótulos.
+
+> **Correção (verificada contra o código da referência).** Versões anteriores deste documento afirmavam que a retificação "opera sobre a representação comprimida do **rótulo**, sem olhar para a imagem" — o que a seção final já marcava como conteúdo de projeto não verificado. **Isso é falso.** Em `networks/unet_de.py` do repositório oficial (`CUHK-AIM-Group/DiffRect`), `UNet_LDMV2.forward` concatena a imagem à máscara colorida antes de comprimir (`x = torch.cat([image, x], dim=1)`) e ainda soma, em cada estágio do encoder, features multiescala de um **segundo** encoder que roda sobre a imagem crua. Só a U-Net de denoising interna (ε) é puramente latente: ela opera sobre um latente que já é condicionado pela imagem.
+>
+> Consequência: a correção **pode**, sim, usar evidência visual para desfazer um erro de posição ou de identidade. As hipóteses que dependiam da propriedade oposta (H4 e H6) precisam ser relidas com isso em mente. Na nossa implementação a propriedade virou a flag `condition_on_image` de `DiffRectLitWrapper` (default `True`, que é o que o código da referência faz), o que transforma a discrepância entre o texto do artigo e o código dele numa ablação de uma linha.
 
 **Escalar de calibração do DiffRect.** O DiffRect calcula uma medida de quanto as duas versões perturbadas do pseudo-rótulo divergem entre si, e usa isso para calibrar a correção. Isso importa porque a ideia de "usar a semelhança entre frames vizinhos como indicador de confiabilidade" é estruturalmente parecida com essa medida — o que levanta a pergunta de se o sinal temporal acrescenta algo além do que o método já computa.
 
@@ -402,6 +406,8 @@ O que reportar: a correlação de cada preditor com o erro real, e sobretudo o *
 **Origem:** Plano V2, E3. Inalterado.
 
 **Procedimento.** Pegar as máscaras anotadas, passá-las pelo compressor de rótulos do DiffRect, descomprimir, e medir Dice e distância entre superfícies entre a original e a reconstruída. Não treina nada.
+
+> **Ajuste decorrente da correção acima.** O compressor **também recebe a imagem**, então "passar a máscara pelo compressor" não está bem definido sem dizer qual imagem acompanha. `RectificationNet` expõe `encode` e `decode` públicos exatamente para este experimento. Há duas leituras, e elas medem coisas diferentes: com `condition_on_image=True` (o compressor da referência) o teto medido é o do método como publicado; com `condition_on_image=False` mede-se o teto da compressão **do rótulo sozinho**, que é a quantidade que o texto original deste documento tinha em mente. Rodar as duas custa o mesmo e a diferença entre elas é, ela própria, um resultado: diz quanto da capacidade do retificador vem da imagem e não do rótulo.
 
 **Interpretação.** Esse número é o limite superior do DiffRect: nenhuma correção recupera o detalhe que a compressão descartou. A comparação correta, como o plano estabelece, **não** é com o supervisionado, e sim com o desempenho dos outros métodos semi-supervisionados. Se o teto ficar abaixo do que Mean Teacher ou FixMatch já entregam, o DiffRect não tem como vencer e as integrações devem ser aplicadas sobre o método mais simples, sem que o cronograma mude.
 

@@ -13,6 +13,11 @@ Deviations from the original, all mechanical:
     the original `[B, 1, H, W]`;
   - one-hot encoding via `torch.nn.functional.one_hot` instead of a Python loop over classes;
   - no hard-coded `.cuda()` anywhere in this module, so it follows the module's device.
+  - `oh_input`, transcribed from the *DiffRect* fork of this same file
+    (https://github.com/CUHK-AIM-Group/DiffRect, MIT, `utils/losses.py:207`), which added it so the
+    Dice could be taken between two hard label maps. DiffRect uses that hard-vs-hard Dice as its
+    calibration guidance (`train_diffrect_ACDC.py:337`), so it is upstream behaviour rather than an
+    invention of this repository.
 The loss arithmetic (squared denominators, `smooth = 1e-5`, unweighted mean over all classes
 *including* background) is unchanged.
 '''
@@ -53,16 +58,24 @@ class DiceLoss(nn.Module):
         target: Tensor,
         weight: Optional[Sequence[float]] = None,
         softmax: bool = False,
+        oh_input: bool = False,
     ) -> Tensor:
         '''
         Args:
-            inputs: `[B, C, H, W]` -- logits when `softmax=True`, probabilities otherwise.
+            inputs: `[B, C, H, W]` -- logits when `softmax=True`, probabilities otherwise. When
+                `oh_input=True` it is instead `[B, H, W]` (or `[B, 1, H, W]`) class indices.
             target: `[B, H, W]` or `[B, 1, H, W]` class indices.
             weight: optional per-class weights (defaults to uniform).
             softmax: apply softmax over the class dimension of `inputs` first.
+            oh_input: one-hot `inputs` as well, giving a hard-vs-hard Dice between two label maps.
+                Mutually exclusive with `softmax`. Used by DiffRect's calibration guidance.
         '''
+        if softmax and oh_input:
+            raise ValueError("softmax and oh_input are mutually exclusive: one expects logits, the other class indices.")
         if softmax:
             inputs = torch.softmax(inputs, dim=1)
+        if oh_input:
+            inputs = self._one_hot_encoder(inputs)
 
         target = self._one_hot_encoder(target)
         if weight is None:

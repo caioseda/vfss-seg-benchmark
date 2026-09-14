@@ -168,17 +168,26 @@ class SemiSupervisedLitWrapper(LitWrapper):
             "absolute `consistency_rampup_steps=` and `consistency_warmup_steps=` overrides."
         )
 
+    def budget_fraction_steps(self, fraction: float, override: Optional[float] = None) -> float:
+        '''
+        Resolve a schedule point expressed as a fraction of the compute budget into absolute steps.
+
+        The one idiom every schedule in this hierarchy uses -- consistency warm-up, consistency
+        ramp-up, and DiffRect's rectification start. An absolute `override` always wins, which is
+        what lets tests pin a schedule without a trainer. See the note on `REFERENCE_TOTAL_STEPS`
+        for why fractions rather than the reference's absolute constants.
+        '''
+        if override is not None:
+            return float(override)
+        return fraction * self.total_training_steps
+
     @property
     def rampup_steps(self) -> float:
-        if self._rampup_steps_override is not None:
-            return float(self._rampup_steps_override)
-        return self.consistency_rampup_fraction * self.total_training_steps
+        return self.budget_fraction_steps(self.consistency_rampup_fraction, self._rampup_steps_override)
 
     @property
     def warmup_steps(self) -> float:
-        if self._warmup_steps_override is not None:
-            return float(self._warmup_steps_override)
-        return self.consistency_warmup_fraction * self.total_training_steps
+        return self.budget_fraction_steps(self.consistency_warmup_fraction, self._warmup_steps_override)
 
     def current_consistency_weight(self) -> float:
         '''Ramped weight of the unsupervised term at the current global step (0 during warm-up).'''
@@ -307,6 +316,51 @@ class SemiSupervisedLitWrapper(LitWrapper):
 
     # ------------------------------------------------------------------ training
 
+    def log_training(
+        self,
+        loss: Tensor,
+        sup_loss: Tensor,
+        unsup_loss: Tensor,
+        weight: float,
+        is_labeled: Tensor,
+        logits: Tensor,
+        targets: Tensor,
+        extra: Optional[Dict[str, Tensor]] = None,
+    ) -> None:
+        '''
+        The training-time log block, shared by every subclass.
+
+        Factored out of `training_step` so that a method which cannot use the shared step --
+        `DiffRectLitWrapper`, which trains a second network -- still emits *exactly* the same keys.
+        The X1/X1B notebooks read these keys off the CSV logger; a method that spelled them
+        differently would silently drop out of the comparison plots.
+
+        Args:
+            extra: additional `{key: scalar}` logged with the same on_epoch reduction. Keys are
+                used verbatim, so they must already carry the `train/` prefix.
+        '''
+        log_dict = {
+            "train/loss": loss,
+            "train/sup_loss": sup_loss,
+            "train/unsup_loss": unsup_loss,
+            "train/unsup_loss_weighted": weight * unsup_loss,
+            "train/consistency_weight": torch.tensor(weight, device=logits.device),
+            "train/labeled_in_batch": is_labeled.sum().float(),
+            "train/unlabeled_in_batch": (~is_labeled).sum().float(),
+        }
+        if extra:
+            log_dict.update(extra)
+        if is_labeled.any():
+            for name, value in self.compute_metrics(logits[is_labeled], targets[is_labeled], stage="train").items():
+                log_dict[f"train/{name}"] = value
+
+        self.log("step", float(self.global_step), prog_bar=True, logger=True, on_step=True, on_epoch=False)
+        # The schedule is the one curve that has to be readable per step: it is what decides whether
+        # the run is a semi-supervised run at all (see the note on REFERENCE_TOTAL_STEPS).
+        self.log("train/consistency_weight_step", weight, prog_bar=False, logger=True,
+                 on_step=True, on_epoch=False)
+        self.log_dict(log_dict, prog_bar=False, logger=True, on_step=False, on_epoch=True)
+
     def training_step(self, batch, batch_idx):
         images, targets = batch["image"], batch["segmentation"]
         is_labeled = self.labeled_mask(batch).to(images.device)
@@ -328,24 +382,5 @@ class SemiSupervisedLitWrapper(LitWrapper):
             unsup_loss = logits.sum() * 0.0
 
         loss = sup_loss + weight * unsup_loss
-
-        log_dict = {
-            "train/loss": loss,
-            "train/sup_loss": sup_loss,
-            "train/unsup_loss": unsup_loss,
-            "train/unsup_loss_weighted": weight * unsup_loss,
-            "train/consistency_weight": torch.tensor(weight, device=images.device),
-            "train/labeled_in_batch": is_labeled.sum().float(),
-            "train/unlabeled_in_batch": (~is_labeled).sum().float(),
-        }
-        if is_labeled.any():
-            for name, value in self.compute_metrics(logits[is_labeled], targets[is_labeled], stage="train").items():
-                log_dict[f"train/{name}"] = value
-
-        self.log("step", float(self.global_step), prog_bar=True, logger=True, on_step=True, on_epoch=False)
-        # The schedule is the one curve that has to be readable per step: it is what decides whether
-        # the run is a semi-supervised run at all (see the note on REFERENCE_TOTAL_STEPS).
-        self.log("train/consistency_weight_step", weight, prog_bar=False, logger=True,
-                 on_step=True, on_epoch=False)
-        self.log_dict(log_dict, prog_bar=False, logger=True, on_step=False, on_epoch=True)
+        self.log_training(loss, sup_loss, unsup_loss, weight, is_labeled, logits, targets)
         return loss

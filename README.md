@@ -39,11 +39,70 @@ without dropping the frames:
 | `SupervisedLitWrapper` | supervised baseline at a given annotation budget |
 | `MeanTeacherLitWrapper` | Mean Teacher (EMA teacher + consistency) |
 | `FixMatchLitWrapper` | FixMatch (confidence-thresholded pseudo-labels) |
-| `DiffRectLitWrapper` | phase-2 slot, raises `NotImplementedError` |
+| `DiffRectLitWrapper` | DiffRect (label context calibration + latent diffusion rectification) |
 
 Loss composition and hyperparameters follow [SSL4MIS](https://github.com/HiLab-git/SSL4MIS) (MIT);
 vendored code lives under `src/third_party/` with provenance headers, and each wrapper's docstring
 records where it deliberately diverges from the reference.
+
+### DiffRect
+
+[DiffRect](https://arxiv.org/abs/2407.09918) (Liu, Li & Yuan, MICCAI 2024) trains a **second**
+network alongside the segmentation U-Net: a latent diffusion model that learns to rectify pseudo
+labels. `src/models/ssl/diffrect_modules.py` holds the modules (semantic colouring, the label
+context encoder, the latent denoising U-Net) and `src/third_party/diffrect/diffusion.py` a minimal
+reimplementation of the diffusion subset actually used (cosine schedule, `q_sample`, DDIM sampling
+with the `START_X` parameterisation) rather than the ~50 KB of upstream `guided_diffusion` that is
+mostly unreachable from this code path.
+
+Two things about it differ from every other wrapper here, both deliberate:
+
+- **Two param groups, one optimizer, one backward.** The reference takes three separate optimizer
+  steps per iteration. Under Lightning that would require `automatic_optimization = False`, which
+  silently redefines `global_step` as *optimizer* steps (so `max_steps: 8000` would stop after
+  ~2,667 batches -- a third of the images the other methods see) and skips the configured LR
+  scheduler without warning. The reference's three backwards are already gradient-disjoint, so a
+  single fused backward over two param groups produces the same gradients while keeping the step
+  budget, the scheduler and `accumulate_grad_batches` intact. `tests/test_ssl_methods.py`
+  (`test_loss_terms_are_gradient_disjoint`) and `tests/test_learning.py`
+  (`test_diffrect_leaves_the_segmentation_path_untouched`) pin that equivalence.
+- **`semi_supervised_base`.** DiffRect's published `L_Semi` is SSL4MIS-flavoured FixMatch (min-max
+  normalise + threshold 0.8 + an entropy-weighted complementary loss), not the canonical FixMatch
+  that `FixMatchLitWrapper` implements. `reference` (the default) reproduces the paper; `canonical`
+  reuses this repo's FixMatch objective, so that DiffRect and FixMatch differ in exactly one thing
+  -- the rectification module.
+
+Where the paper's text and the reference code disagree, the code wins and a test pins it. The two
+that matter: the rectifier **is** conditioned on the image (the paper's prose suggests otherwise --
+see `condition_on_image`), and the calibration guidance is the Dice *loss*, not the Dice score as
+Eq. 6 states.
+
+> Design decisions behind the DiffRect port and this reproduction -- what was adapted rather than
+> changed, where the hyperparameters diverge and why, the backbone difference, and what each test
+> is guarding against -- are recorded in [`docs/diffrect-decisoes.md`](docs/diffrect-decisoes.md).
+
+## ACDC reproduction (acceptance test for the SSL port)
+
+Nothing in the VFSS pipeline distinguishes "the port is broken" from "the method does not help on
+VFSS". `notebooks/hyphotesis_testing/experiment_acdc_ssl_reproduction.ipynb` runs the same wrappers
+on ACDC, where the numbers have a published answer, and is the gate the X1 grid runs behind.
+
+```bash
+python scripts/prepare_acdc.py --root /data_ssd/caioseda/data/ACDC
+```
+
+Downloads raw ACDC from the `MedOtter/ACDC` HuggingFace mirror (CC BY-NC-SA-4.0; cite Bernard et
+al., IEEE TMI 2018), reproduces SSL4MIS's preprocessing and uses their split lists verbatim --
+140/20/40 volumes and 1312 training slices, the same counts DiffRect reports. Configs are in
+`configs/experiment/acdc/`; unlike the X1 configs they follow the reference's hyperparameters
+(SGD 0.01 with 0.9 poly decay, 30k iterations, batch 6/3) because there the point is comparability
+with a published number rather than between methods.
+
+Evaluation is **volumetric** (`src/evaluation_volume.py`), and checkpoints are selected on
+`val/dice_volume`, produced by the `src.callbacks.VolumetricValidation` callback -- per-slice Dice
+over a stack is a different quantity from the volumetric Dice the ACDC literature reports. HD95 and
+ASD are reimplemented on `scipy.ndimage` rather than taken from `medpy` (GPL-3.0), so they are
+implementation-comparable rather than bit-identical to the published millimetre figures.
 
 ## Tests
 
