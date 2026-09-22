@@ -7,6 +7,22 @@ from torchmetrics.functional.segmentation.utils import edge_surface_distance
 DistanceMetric = str  # "euclidean" | "chessboard" | "taxicab"
 
 
+def _max_distance(shape: Sequence[int], spacing: Optional[Sequence[float]]) -> float:
+    '''
+    Diagonal of an image/volume of `shape` under `spacing` (unit spacing when `None`).
+
+    Used as the worst-case distance sentinel for ASSD/HD95 when a class is present in only one of
+    prediction/target ("undetected structure" or "hallucinated structure") -- see
+    `_pairwise_surface_distances`/`volumetric_surface_distances`. This follows the convention
+    segmentation challenges such as BraTS use for the same degenerate case (there, a fixed 373.13 mm,
+    the diagonal of their reference volume): the distance is a defined worst case, not an undefined
+    one, and must not be dropped from an average via `nanmean`.
+    '''
+    if spacing is None:
+        spacing = [1.0] * len(shape)
+    return float(sum((size * sp) ** 2 for size, sp in zip(shape, spacing)) ** 0.5)
+
+
 def absent_class_to_nan(values: Tensor) -> Tensor:
     '''
     Normalise torchmetrics' "class absent from both prediction and target" sentinel to NaN.
@@ -47,14 +63,17 @@ def _pairwise_surface_distances(
     Degenerate cases per (batch, class) pair:
     - Class absent from both prediction and target: distance is defined as 0.0 (perfect agreement
       that the structure is not present).
-    - Class present in only one of prediction/target: distance is undefined and reported as NaN.
-      Aggregate the returned tensor with `.nanmean()` (not `.mean()`) so a single such pair does not
-      turn an entire batch/epoch average into NaN.
+    - Class present in only one of prediction/target: this is the worst possible outcome (a missed
+      or hallucinated structure), not an undefined one. Reported as `_max_distance` (the image
+      diagonal) rather than NaN -- see that function's docstring for why. A NaN here would vanish
+      under `.nanmean()`, silently excluding exactly the worst-scoring samples from the average
+      instead of penalizing it.
 
     Returns a `[B, C]` tensor (`C` excludes the background class when it was excluded from the masks).
     '''
     batch_size, num_included_classes = preds_masks.shape[:2]
-    out = torch.full((batch_size, num_included_classes), float("nan"), device=preds_masks.device)
+    penalty = _max_distance(preds_masks.shape[2:], spacing)
+    out = torch.full((batch_size, num_included_classes), penalty, device=preds_masks.device)
 
     for b in range(batch_size):
         for c in range(num_included_classes):
@@ -71,7 +90,7 @@ def _pairwise_surface_distances(
             all_distances = torch.cat([dist_pred_to_target, dist_target_to_pred])
 
             if all_distances.numel() == 0 or torch.isinf(all_distances).any():
-                # Class present in only one of pred/target -> undefined, left as NaN.
+                # Class present in only one of pred/target -> worst case, keep the penalty set above.
                 continue
 
             out[b, c] = all_distances.mean() if reduce == "mean" else torch.quantile(all_distances, 0.95)
@@ -101,7 +120,8 @@ def average_symmetric_surface_distance(
     Returns:
         A `[B, C]` tensor of ASSD per batch element and class (`C = num_classes - 1` if
         `include_background=False`). See `_pairwise_surface_distances` for the convention used for
-        classes absent from prediction and/or target. Aggregate with `.nanmean()`.
+        classes absent from prediction and/or target -- no NaN is produced, so plain `.mean()` is
+        safe to aggregate with.
     '''
     preds_masks = _class_masks(preds, num_classes, include_background)
     target_masks = _class_masks(target, num_classes, include_background)
@@ -189,8 +209,8 @@ def volumetric_surface_distances(
 
     Returns:
         A `[C]` tensor. Degenerate cases follow the same convention as
-        `_pairwise_surface_distances`: absent from both -> 0.0, present in only one -> NaN.
-        Aggregate with `.nanmean()`.
+        `_pairwise_surface_distances`: absent from both -> 0.0, present in only one -> `_max_distance`
+        (the volume diagonal), not NaN, so plain `.mean()` is safe to aggregate with.
     '''
     import numpy as np
 
@@ -198,7 +218,8 @@ def volumetric_surface_distances(
     target_np = target.detach().cpu().numpy()
     class_ids = list(range(num_classes) if include_background else range(1, num_classes))
 
-    out = torch.full((len(class_ids),), float("nan"), dtype=torch.float32)
+    penalty = _max_distance(preds_np.shape, spacing)
+    out = torch.full((len(class_ids),), penalty, dtype=torch.float32)
     for column, class_id in enumerate(class_ids):
         pred_mask = preds_np == class_id
         target_mask = target_np == class_id
@@ -207,7 +228,7 @@ def volumetric_surface_distances(
             out[column] = 0.0
             continue
         if not pred_mask.any() or not target_mask.any():
-            continue  # undefined, stays NaN
+            continue  # worst case: keep the penalty set above
 
         distances = _surface_distances(pred_mask, target_mask, spacing=spacing)
         if distances.size == 0:

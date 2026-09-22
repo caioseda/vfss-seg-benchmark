@@ -257,6 +257,16 @@ anexa o `ModelCheckpoint` **depois** dos callbacks do config, e este lê `traine
 em `on_validation_end` — então `monitor: val/dice_volume` resolve sem tocar em `LitWrapper`,
 `DataModuleFromConfig` ou `Experiment`.
 
+**`aggregate_volumes` herdava (e agora não herda mais) um viés de `nanmean`**, documentado como
+achado **A2** em `docs/x1-revisao-mudancas.md`: um volume com uma classe presente em só um dos
+lados (pred/target) contava como NaN e saía da média de HD95/ASD em vez de penalizá-la — mesmo
+padrão que reverteu o sinal de uma comparação entre orçamentos no X1. Corrigido na fonte
+(`_max_distance` em `src/metrics.py`, usado por `volumetric_surface_distances`): `aggregate_volumes`
+não precisou mudar, só parou de receber NaN para descartar. Ainda assim, vale conferir quando a
+grade do ACDC terminar quantos volumes caíam nesse caso em 1%/5% **antes** da correção — se for uma
+fração relevante, o HD95/ASD do notebook muda de valor com a correção, e a comparação de aceitação
+contra o número publicado precisa usar o valor recalculado, não o antigo.
+
 **Sem medpy.** A referência calcula `dc`/`jc`/`hd95` com `medpy`, que é GPL-3.0. Este repositório já
 recusou dependência de licença restritiva antes — `sigmoid_rampup` foi reimplementado a partir do
 artigo para não puxar a CC BY-NC do `ramps.py` do SSL4MIS. Então HD95/ASD foram reimplementados

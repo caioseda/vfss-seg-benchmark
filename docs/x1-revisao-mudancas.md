@@ -217,12 +217,14 @@ dataset inteiro (86 batches, não 172).
 |---|---|---|
 | `dice_score(average="none")` | NaN | valor normal |
 | `mean_iou(per_class=True)` | **-1.0** ← sentinela | valor normal |
-| `average_symmetric_surface_distance` | 0.0 | **NaN** |
-| `hausdorff_distance_95` | 0.0 | **NaN** |
+| `average_symmetric_surface_distance` | 0.0 | **diagonal da imagem** (era NaN — corrigido, achado A2) |
+| `hausdorff_distance_95` | 0.0 | **diagonal da imagem** (era NaN — corrigido, achado A2) |
 
 `absent_class_to_nan` ([src/metrics.py:10](src/metrics.py#L10)) normaliza o `-1.0` do IoU para NaN,
 para que **tudo** possa ser agregado com `.nanmean()`. Sem isso, com `multiclass_c2_c4` a classe 2
-(C3) — que nunca aparece — injetaria `-1` em **toda** amostra.
+(C3) — que nunca aparece — injetaria `-1` em **toda** amostra. Dice/IoU ainda usam NaN para "ausente
+dos dois" e ainda dependem de `.nanmean()`; ASSD/HD95 não produzem mais NaN nenhum (ver A2), então
+`nanmean` continua correto para agregá-los, só nunca mais tem nada para descartar nessas duas colunas.
 
 ### 4.2 `report_class_ids` — por que não é só cosmético
 
@@ -478,7 +480,121 @@ da curva do supervisionado), não. Para "SSL recupera quanto da margem?", sim �
 
 ---
 
-### 🟠 A2 — As diferenças entre métodos podem não vir do termo de consistência
+### 🔴 A2 — ASSD/HD95 descartam via NaN exatamente os frames mais errados, inflando a "melhora" entre orçamentos
+
+**Status: corrigido de ponta a ponta.** `src/metrics.py` (`_max_distance`,
+`_pairwise_surface_distances`, `volumetric_surface_distances`) corrigido e coberto por
+`tests/test_metrics.py`. `logs/x1/results_per_sample.csv` já foi **reprocessado** com a mesma
+constante que o código corrigido usa — original preservado em `results_per_sample_pre_a2_fix.csv`
+para auditoria.
+
+**O quê (comportamento antigo, que motivou a correção).**
+`_pairwise_surface_distances` definia ASSD/HD95
+como `NaN` quando a classe está presente em só um dos dois lados (pred vazio/GT presente, ou o
+inverso) — "estrutura não detectada" é literalmente o pior erro possível, não um caso indefinido
+inofensivo. `aggregate_per_class` ([src/evaluation.py:122](src/evaluation.py#L122)) reduz com
+`nanmean`, então esses frames **saem do denominador da média** em vez de puxá-la para cima. O Dice,
+no mesmo frame, não tem essa saída: `dice_score` retorna `0.0` de verdade e entra na média normalmente.
+Resultado: Dice enxerga o pior erro como pior erro; ASSD/HD95 simplesmente fingem que aquele frame
+não existiu.
+
+**Confirmado empiricamente em `logs/x1/results_per_sample.csv` (já rodado, sem re-treinar nada).**
+Separando os frames com Dice = 0 em dois grupos — (a) uma máscara inteiramente vazia → ASSD/HD95 vira
+NaN e é descartado; (b) as duas máscaras não-vazias mas sem sobreposição → ASSD/HD95 continua um
+número real, tipicamente grande:
+
+| método | orçamento | frames Dice=0 | dos quais descartados (NaN) | dos quais ainda contam na média |
+|---|---|---|---|---|
+| supervised | 50% | 22 | 11 | 11 |
+| supervised | 75% | 22 | **20** | 2 |
+| diffrect | 50% | 0 | 0 | 0 |
+| diffrect | 75% | 7 | **5** | 2 |
+
+O total de frames ruins do supervisionado não muda (22→22): o que muda é o *tipo* de erro — de
+"estrutura errada mas presente" (penalizado corretamente) para "estrutura sumiu" (excluído). No
+DiffRect, 75% introduz 7 frames de vértebra não detectada que não existiam em 50%, e 5 deles somem
+da conta em vez de puxar a média para cima.
+
+Recalculando com uma penalidade fixa de "não detectado" (diagonal da imagem, 362,0387 px em
+256×256, no lugar do NaN) em vez de descartar:
+
+| | HD95 antigo (nanmean) | HD95 com penalidade | ASSD antigo | ASSD com penalidade |
+|---|---|---|---|---|
+| supervised 50% | 8,87 | 20,17 | 2,60 | 14,09 |
+| supervised 75% | 5,50 | **26,23** | 2,09 | **23,01** |
+| diffrect 50% | 6,91 | 6,91 | 1,81 | 1,81 |
+| diffrect 75% | 4,57 | **9,76** | 1,67 | **6,91** |
+
+A "melhora" de 75% sobre 50% **inverte de sinal** nos dois métodos assim que os frames descartados
+voltam a contar. O padrão observado no notebook (supervisionado HD95 8,94→5,45; DiffRect 6,91→4,57)
+é consistente com viés de seleção na agregação, não com ganho real de localização. Estes são os
+valores que já estão em `results_per_sample.csv` hoje (coluna `assd`/`hd95` pós-correção).
+
+**Verificação de colisão antes de reprocessar.** Preencher o `NaN` com uma constante fixa só é seguro
+se nenhuma distância *real* já calculada coincidir com essa constante — do contrário, a coluna
+resultante confundiria "não detectado" com "detectado, e por acaso à distância exata da diagonal".
+Checado sobre as 5400 linhas com valor válido: o maior ASSD real observado é 177,38 e o maior HD95
+real é 209,08 — ambos bem abaixo de 362,04 (a diagonal só é atingível por uma distância real se as
+duas estruturas estivessem em cantos opostos da imagem, o que não ocorre nesta anatomia). Nenhum
+valor válido caiu a menos de `1e-3` da constante. Também confirmado: as 104 linhas com `assd` NaN são
+exatamente as mesmas 104 com `hd95` NaN, e todas têm `dice == 0` — nenhuma linha teria seu NaN
+originado de outra causa. Por segurança adicional (e não só pela ausência de colisão), o CSV agora
+carrega uma coluna booleana `undetected` gravada **antes** do `fillna`, para que "não detectado"
+nunca precise ser inferido de volta a partir do valor numérico.
+
+**Taxa de frames com estrutura não detectada, por método e orçamento (C2+C4):**
+
+| método | 25% | 50% | 75% | 100% |
+|---|---|---|---|---|
+| supervised | 8 (2,3%) | 11 (3,2%) | **20 (5,8%)** | 10 (2,9%) |
+| fixmatch | 2 (0,6%) | 0 (0,0%) | 10 (2,9%) | 0 (0,0%) |
+| meanteacher | 2 (0,6%) | 4 (1,2%) | 8 (2,3%) | 2 (0,6%) |
+| diffrect | 10 (2,9%) | 0 (0,0%) | 5 (1,5%) | 12 (3,5%) |
+
+(n = 344 frames por célula, C2+C4 juntas; 5504 linhas no total, 104 marcadas `undetected`.) Note o
+comportamento não-monótono do supervisionado (3,2%→5,8%→2,9% de 50%→75%→100%) — mais um sinal de que
+o pico em 75% é ruído de uma única seed, não uma tendência suave que "a médias distâncias melhoram
+com mais rótulos" sustentaria.
+
+**Por que a literatura trata isso como erro conhecido, não escolha estilística.** Reinke et al.,
+*"Common Limitations of Image Processing Metrics: A Picture Story"* (arXiv:2104.05642) e Maier-Hein
+et al., *"Metrics reloaded"* (Nature Methods, 2024) listam nominalmente o descarte silencioso de
+valores indefinidos de HD/ASD como uma armadilha de validação — a recomendação é adotar uma regra
+explícita e documentada para o caso "presente em só um lado", nunca deixá-lo cair fora da média sem
+registro. O convênio de campo mais citado é o do BraTS: quando a predição está vazia e a referência
+não, ou vice-versa, `Dice = 0` **e** `HD95` recebe um valor-sentinela fixo (a diagonal do volume,
+373,13 mm no BraTS) em vez de indefinido — o objetivo declarado é impedir que a ausência total de
+detecção pareça, na média, melhor do que uma detecção errada.
+
+**Isso não afetava só o X1.** `aggregate_volumes` ([src/evaluation_volume.py:174](src/evaluation_volume.py#L174))
+usa o mesmo `nanmean` sobre HD95/ASD volumétricos — a mesma rota que decide se o gate do ACDC fecha
+(ver `docs/diffrect-decisoes.md`, item 10). Corrigir na fonte (`_max_distance` dentro de
+`volumetric_surface_distances`) resolve os dois de uma vez: `aggregate_volumes` não precisou mudar,
+porque simplesmente não recebe mais NaN de HD95/ASD para descartar. Ainda vale checar, quando a
+grade do ACDC terminar, quantos volumes caíam no caso "presente em só um lado" **antes** da
+correção — se for um número relevante em 1%/5%, o HD95/ASD publicado no notebook do ACDC muda de
+valor com esta correção, e a comparação com o número da literatura precisa ser refeita.
+
+**Isso invalidou a grade X1 já rodada?** Não foi preciso re-treinar nem re-rodar
+`evaluate_per_class` — os valores por frame já estavam corretos (o NaN por frame identificava
+exatamente os casos "presente em só um lado"); só a agregação precisava mudar. `fillna(362.0387)`
+nas colunas `assd`/`hd95` do CSV existente reproduz exatamente o que uma nova passagem de
+`evaluate_per_class` daria com o código corrigido — `362.0387` é `_max_distance((256, 256),
+spacing=None)`, a mesma constante usada para os frames X1 (256×256). **Feito**: original preservado
+em `logs/x1/results_per_sample_pre_a2_fix.csv`; `logs/x1/results_per_sample.csv` já tem `assd`/`hd95`
+sem NaN e a coluna `undetected`.
+
+**O que ainda falta.** As tabelas e gráficos do notebook (`experiment_1_does_ssl_helps.ipynb`,
+células 25+) ainda não foram re-executados sobre o CSV corrigido — o texto/números impressos nas
+células continuam refletindo a agregação antiga até alguém rodar o notebook de novo. Também não há
+ainda, em `aggregate_per_class`/no notebook, uma coluna automática reportando a taxa de
+`undetected` por método/orçamento/classe (a tabela acima foi calculada à parte) — vale promovê-la a
+algo que aparece ao lado do agregado, para que a melhora de ASSD/HD95 nunca seja lida sem saber
+quantos frames a compunham.
+
+---
+
+### 🟠 A3 — As diferenças entre métodos podem não vir do termo de consistência
 
 Se o peso da consistência é ~0.003 (A1), de onde vêm as diferenças observadas?
 
@@ -510,7 +626,7 @@ Não são bugs — os dois comportamentos batem com as respectivas referências.
 
 ---
 
-### 🟠 A3 — A célula "degenerada" de 100% não é degenerada para o Mean Teacher
+### 🟠 A4 — A célula "degenerada" de 100% não é degenerada para o Mean Teacher
 
 O runner ([célula 15](notebooks/hyphotesis_testing/experiment_1_does_ssl_helps.ipynb)) trata
 `método != supervised and fraction >= 1.0` como degenerado e **reusa a linha do supervisionado**,
@@ -538,7 +654,7 @@ usa o teto do supervisionado — logo compara maçãs com laranjas na ponta de c
 
 ---
 
-### 🟡 A4 — Nenhuma augmentation no ramo supervisionado
+### 🟡 A5 — Nenhuma augmentation no ramo supervisionado
 
 `weak_augment` só é chamado dentro do `unsupervised_loss` do FixMatch. As linhas **rotuladas** vão
 para a `supervised_loss` sem augmentation nenhuma — não há transform aleatório no `Dataset`
@@ -555,16 +671,16 @@ transforma os dois com os mesmos parâmetros — a plumbing existe.
 
 ---
 
-### 🟡 A5 — Detalhes menores
+### 🟡 A6 — Detalhes menores
 
 | # | Achado | Onde |
 |---|---|---|
-| A5.1 | `src/data/vfss.py` ainda define `VFSSIncaTrain/Val/Test` com os mesmos nomes das classes novas. Nenhum config aponta pra lá, mas é uma armadilha de import. | [src/data/vfss.py:84](src/data/vfss.py#L84) |
-| A5.2 | `nohup.out` (928 linhas de log) foi commitado em `7fe17b0`. | raiz |
-| A5.3 | No reuso da célula degenerada, `output_dir` copiado aponta para o run **do supervisionado**. Confunde rastreabilidade. | notebook, célula 19 |
-| A5.4 | `weak_augment`/`strong_augment` são laços Python por elemento do batch, com sync GPU→CPU por sorteio. Aceitável em bs=8; gargalo se escalar. | [src/data/augmentations.py](src/data/augmentations.py) |
-| A5.5 | `DiceLoss` inclui o fundo na média (fiel à referência), então C3 — sempre vazia — entra como termo perfeito e dilui o sinal. Fiel, mas note a interação com `report_class_ids`, que **exclui** C3. Loss e métrica não olham para o mesmo conjunto de classes. | [losses.py:73](src/third_party/ssl4mis/losses.py#L73) |
-| A5.6 | `window_size=1` em todos os configs X1: o eixo temporal ainda não está em jogo. Coerente com o X1 ser o *gate* para a contribuição temporal, mas vale explicitar. | `configs/experiment/x1/*.yaml` |
+| A6.1 | `src/data/vfss.py` ainda define `VFSSIncaTrain/Val/Test` com os mesmos nomes das classes novas. Nenhum config aponta pra lá, mas é uma armadilha de import. | [src/data/vfss.py:84](src/data/vfss.py#L84) |
+| A6.2 | `nohup.out` (928 linhas de log) foi commitado em `7fe17b0`. | raiz |
+| A6.3 | No reuso da célula degenerada, `output_dir` copiado aponta para o run **do supervisionado**. Confunde rastreabilidade. | notebook, célula 19 |
+| A6.4 | `weak_augment`/`strong_augment` são laços Python por elemento do batch, com sync GPU→CPU por sorteio. Aceitável em bs=8; gargalo se escalar. | [src/data/augmentations.py](src/data/augmentations.py) |
+| A6.5 | `DiceLoss` inclui o fundo na média (fiel à referência), então C3 — sempre vazia — entra como termo perfeito e dilui o sinal. Fiel, mas note a interação com `report_class_ids`, que **exclui** C3. Loss e métrica não olham para o mesmo conjunto de classes. | [losses.py:73](src/third_party/ssl4mis/losses.py#L73) |
+| A6.6 | `window_size=1` em todos os configs X1: o eixo temporal ainda não está em jogo. Coerente com o X1 ser o *gate* para a contribuição temporal, mas vale explicitar. | `configs/experiment/x1/*.yaml` |
 
 ---
 
@@ -619,13 +735,18 @@ print(d.groupby(['run_id','class'])[['dice','iou','assd','hd95']].mean().round(4
 (Dice médio no test set.)
 
 **Margem do supervisionado (10% → 100%): +0.335 Dice em C2 e +0.665 em C4.** O gate está
-**amplamente aberto** — há muito a recuperar, e a leitura do X1 não depende dos achados A1–A3, que
-afetam só a segunda pergunta ("quanto o SSL recupera dessa margem?").
+**amplamente aberto** — há muito a recuperar, e essa leitura (baseada em Dice) não depende dos
+achados A1, A3 e A4, que afetam só a segunda pergunta ("quanto o SSL recupera dessa margem?"). Já a
+leitura de ASSD/HD95 especificamente **depende de A2** — qualquer "melhora" nessas duas métricas
+entre orçamentos precisa ser conferida contra a taxa de frames descartados antes de virar conclusão.
 
 ### 9.4 Ordem sugerida de ação
 
 1. Corrigir `consistency_rampup_divisor` (A1) e re-rodar a grade — é o que dá sentido à comparação SSL.
-2. Rodar meanteacher@100% de verdade, ou documentar o reuso (A3).
-3. Ablação `evaluate_with_teacher: False` e forward-dummy no supervisionado (A2), para atribuir o ganho.
-4. `LABEL_GROUP_COLUMN="video_id"` como checagem de robustez do ponto de 10% (3 pacientes).
-5. Mais seeds em `SEEDS` — hoje há uma só, e nenhuma barra de erro.
+2. **(A2, feito)** `src/metrics.py` corrigido e `results_per_sample.csv` reprocessado
+   (`assd`/`hd95` sem NaN + coluna `undetected`). Falta só re-rodar as células 25+ do notebook para
+   que as tabelas/gráficos exibidos reflitam os números corrigidos.
+3. Rodar meanteacher@100% de verdade, ou documentar o reuso (A4).
+4. Ablação `evaluate_with_teacher: False` e forward-dummy no supervisionado (A3), para atribuir o ganho.
+5. `LABEL_GROUP_COLUMN="video_id"` como checagem de robustez do ponto de 10% (3 pacientes).
+6. Mais seeds em `SEEDS` — hoje há uma só, e nenhuma barra de erro.

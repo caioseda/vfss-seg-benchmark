@@ -182,6 +182,53 @@ def apply_label_regime(
     return df
 
 
+def apply_label_regime_by_count(
+    df: pd.DataFrame,
+    group_column: str = "video_id",
+    frames_per_group: int = 1,
+    seed: int = 42,
+    split_column: str = "split",
+    label_regime_splits: Sequence[str] = ("train",),
+) -> pd.DataFrame:
+    '''
+    Add an `is_labeled` boolean column to `df`, revealing up to `frames_per_group` labeled frames
+    per group (by default `video_id`) among the rows in `label_regime_splits` (by default just
+    'train'). Rows outside `label_regime_splits` (e.g. val/test) always get `is_labeled=True`.
+
+    Unlike `apply_label_regime` (which reveals a *fraction* of groups in full), this reveals a
+    *fixed count* of frames within every group. Groups with fewer than `frames_per_group` annotated
+    frames simply reveal all of them -- annotation counts per video are not uniform in this dataset,
+    and there is no other group to borrow frames from.
+
+    Regimes are nested for a fixed `seed`: each group's frames are shuffled once (`RandomState(seed)`
+    consumed group by group, in `group_column` sort order), and revealing `frames_per_group=k` takes
+    the first `k` of that fixed order. So `revealed(k) <= revealed(k + 1)` per group for any `k`,
+    which is what makes budgets of 2/3/4/5 frames directly comparable (same idea as the nesting
+    invariant in `apply_label_regime`, but the invariant held constant is frame count per video, not
+    a global fraction per patient).
+
+    No rows are ever dropped by this function -- frames whose label is hidden remain in `df`, just
+    flagged `is_labeled=False`.
+    '''
+    if frames_per_group < 1:
+        raise ValueError(f"frames_per_group must be >= 1, got {frames_per_group}")
+
+    df = df.copy()
+    df['is_labeled'] = True
+
+    applicable_mask = df[split_column].isin(label_regime_splits)
+    if applicable_mask.any():
+        subset = df.loc[applicable_mask]
+        rng = np.random.RandomState(seed)
+        revealed_index = []
+        for _, group_rows in subset.groupby(group_column, sort=True):
+            shuffled = rng.permutation(group_rows.index.to_numpy())
+            revealed_index.extend(shuffled[:frames_per_group])
+        df.loc[applicable_mask, "is_labeled"] = df.loc[applicable_mask].index.isin(set(revealed_index))
+
+    return df
+
+
 def build_unlabeled_frame_pool(
     dataset_path: Union[str, Path],
     annotated_df: pd.DataFrame,
@@ -317,6 +364,7 @@ class VFSSFrameDatasetBase(Dataset):
                  split_ratios: Sequence[float] = DEFAULT_SPLIT_RATIOS,
                  split_group_column: str = "paciente_id",
                  label_fraction: float = 1.0,
+                 label_frames_per_group: Optional[int] = None,
                  label_seed: int = 42,
                  label_group_column: str = "paciente_id",
                  label_regime_splits: Sequence[str] = ("train",),
@@ -346,9 +394,14 @@ class VFSSFrameDatasetBase(Dataset):
                 (por padrão `paciente_id`; datasets sem esse identificador podem usar `video_id`).
             label_fraction (float): Fração (por `label_group_column`) dos frames de `label_regime_splits` que mantêm
                 o rótulo revelado; o restante é marcado `is_labeled=False` mas continua no dataset (não é descartado).
-                Regimes são aninhados para um `label_seed` fixo: ver `apply_label_regime`.
+                Regimes são aninhados para um `label_seed` fixo: ver `apply_label_regime`. Ignorado quando
+                `label_frames_per_group` é passado.
+            label_frames_per_group (int, optional): Quando definido, substitui `label_fraction`: revela até esse
+                número de frames rotulados por grupo (por padrão `label_group_column`), em vez de uma fração de
+                grupos inteiros. Grupos com menos frames anotados do que o pedido revelam todos os que tiverem.
+                Ver `apply_label_regime_by_count`.
             label_seed (int): Seed usada para computar o regime de rótulo. Deve ser mantida fixa entre diferentes
-                `label_fraction` para garantir o aninhamento dos conjuntos revelados.
+                `label_fraction`/`label_frames_per_group` para garantir o aninhamento dos conjuntos revelados.
             label_group_column (str): Coluna usada para agrupar frames ao aplicar o regime de rótulo (por padrão `paciente_id`).
             label_regime_splits (Sequence[str]): Splits sujeitos ao mascaramento de rótulo (por padrão só `('train',)`);
                 qualquer split fora dessa lista (ex: val/test) sempre mantém `is_labeled=True`.
@@ -409,17 +462,28 @@ class VFSSFrameDatasetBase(Dataset):
             )
 
         self.label_fraction = label_fraction
+        self.label_frames_per_group = label_frames_per_group
         self.label_seed = label_seed
         self.label_group_column = label_group_column
         self.label_regime_splits = tuple(label_regime_splits)
-        self.video_frame_df = apply_label_regime(
-            self.video_frame_df,
-            group_column=label_group_column,
-            label_fraction=label_fraction,
-            seed=label_seed,
-            split_column="split",
-            label_regime_splits=self.label_regime_splits,
-        )
+        if label_frames_per_group is not None:
+            self.video_frame_df = apply_label_regime_by_count(
+                self.video_frame_df,
+                group_column=label_group_column,
+                frames_per_group=label_frames_per_group,
+                seed=label_seed,
+                split_column="split",
+                label_regime_splits=self.label_regime_splits,
+            )
+        else:
+            self.video_frame_df = apply_label_regime(
+                self.video_frame_df,
+                group_column=label_group_column,
+                label_fraction=label_fraction,
+                seed=label_seed,
+                split_column="split",
+                label_regime_splits=self.label_regime_splits,
+            )
 
         # The unlabeled pool is appended *after* the label regime: `label_fraction` is a fraction of
         # the annotated frames, and these frames were never annotated, so they are outside its
