@@ -1,0 +1,68 @@
+# X1B -- o efeito da politica de amostragem do fluxo nao rotulado, com o orcamento de rotulo fixo
+# em 100%. Reusa `configs/experiment/x1/` de proposito: a unica diferenca em relacao ao X1 e a
+# politica, e e isso que torna a comparacao interpretavel.
+#
+#   scripts/submit.sh configs/sweep/x1b.yaml
+type: sweep
+name: x1b
+family: x1b
+plan: src.sweeps.x1.X1BSweep
+
+# Ordem dos eixos = ordem em que as celulas rodam (produto cartesiano, primeiro eixo mais externo).
+# O orcamento de rotulo e fixo: o que varia e SO a politica de amostragem do fluxo nao rotulado.
+# Os nomes aqui sao os EXIBIDOS, e entram no run_id com o "=" removido ("W=5" -> "W5") -- os mesmos
+# run_id ja gravados em logs/x1b/results_per_sample.csv.
+axes:
+  seed: [42]
+  policy: [global, same_video, "W=5", "W=10", "W=15"]
+  method: [supervised, fixmatch, meanteacher, diffrect]
+
+# Nome exibido -> o que ele significa no TwoStreamBatchSampler.
+policies:
+  global:     {unlabeled_policy: global,          temporal_window: null}
+  same_video: {unlabeled_policy: same_video,      temporal_window: null}   # o default do X1
+  "W=5":      {unlabeled_policy: temporal_window, temporal_window: 5}
+  "W=10":     {unlabeled_policy: temporal_window, temporal_window: 10}
+  "W=15":     {unlabeled_policy: temporal_window, temporal_window: 15}
+
+base_configs:
+  supervised:  configs/experiment/x1/x1-unet-supervised.yaml
+  fixmatch:    configs/experiment/x1/x1-unet-fixmatch.yaml
+  meanteacher: configs/experiment/x1/x1-unet-meanteacher.yaml
+  diffrect:    configs/experiment/x1/x1-unet-diffrect.yaml
+
+training:
+  # Orcamento de compute FIXO em passos: todo run ve o mesmo numero de imagens, independente do
+  # orcamento de anotacao. `max_steps` tambem ancora o cronograma de consistencia.
+  max_steps: 8000
+  val_every_n_steps: 500      # convertido em `check_val_every_n_epoch` por celula, ver src/sweeps/x1.py
+  batch_size: 8
+  labeled_batch_size: 4       # os outros 4 vem do fluxo nao rotulado, em TODOS os orcamentos
+  # Orcamento principal: isola proximidade temporal de cobertura.
+  label_fraction: 1.00
+  unlabeled_policy: same_video  # sobrescrito por celula pelo eixo `policy`
+
+data:
+  dataset_path: /data_ssd/caioseda/data/dataset_inca_all_frames/
+  # O fold unico do X1: fixo em todos os runs, para que a comparacao seja entre orcamentos de
+  # rotulo e nao entre splits.
+  split_seed: 42
+  split_ratios: [0.7, 0.10, 0.2]
+  split_group_column: paciente_id
+  # label_seed FIXO garante o aninhamento entre orcamentos: revelados(25%) subset revelados(50%) ...
+  label_seed: 42
+  label_group_column: paciente_id
+  # Pool DENSO, diferente do X1 de proposito: uma janela temporal so existe se os vizinhos do frame
+  # ancora estiverem no pool. `unlabeled_pool_size: null` e TETO ausente, nao interruptor -- por isso
+  # `use_unlabeled_pool` e explicito.
+  use_unlabeled_pool: true
+  unlabeled_pool_size: null        # sem teto: todos os frames nunca anotados dos videos de treino
+  unlabeled_pool_frame_stride: 1   # sem stride: as janelas precisam dos vizinhos
+  unlabeled_pool_seed: 42
+  unlabeled_pool_splits: [train]
+
+evaluation:
+  num_classes: 4
+  class_ids: {1: C2, 3: C4}   # 0=fundo, 2=C3 nunca aparece em multiclass_c2_c4
+
+results_csv: results_per_sample.csv

@@ -1,3 +1,4 @@
+from lightning_fabric.utilities.seed import _collect_rng_states, _set_rng_states
 from pytorch_lightning.callbacks import Callback
 from src.utils import instantiate_from_config
 from omegaconf import DictConfig, ListConfig, OmegaConf
@@ -157,3 +158,72 @@ class VolumetricValidation(Callback):
 
         pl_module.log_dict(logs, prog_bar=False, logger=True, on_step=False, on_epoch=True,
                            sync_dist=True)
+
+
+class ResumeFidelity(Callback):
+    '''
+    Carries the RNG state through a checkpoint, so a resumed run continues the *same* trajectory
+    rather than a merely plausible one.
+
+    Lightning restores the model, the optimizer state, the LR scheduler and `global_step`, but
+    **not** the random number generators: `_collect_rng_states` exists in
+    `lightning_fabric/utilities/seed.py` and is used only by the multiprocessing launcher --
+    `_CheckpointConnector.dump_checkpoint` never writes it. Without this, everything downstream of
+    a draw diverges after a resume: the augmentations, the Mean Teacher's input noise, FixMatch's
+    cutout and DiffRect's `q_sample`.
+
+    What already survives a resume without help, and is therefore deliberately *not* touched here:
+
+      - the consistency ramp and warm-up, because they are computed from `global_step` and
+        `total_training_steps` rather than from a counter of their own (`src/models/ssl/base.py`);
+      - the Mean Teacher EMA decay, `min(1 - 1/(global_step+1), ema_decay)`
+        (`src/models/ssl/mean_teacher.py`);
+      - the teacher weights themselves, which are a submodule and so travel in `state_dict`;
+      - the LR, which `checkpoint["lr_schedulers"]` restores via the scheduler's `last_epoch`.
+
+    Scope of the guarantee. The *schedule* is restored exactly -- LR, consistency weight and EMA
+    decay at step N are identical whether or not the run was interrupted, because all three are
+    functions of `global_step`. Bit-exactness of the *augmentation* draws additionally requires
+    `num_workers=0`: with worker processes, each worker's seed is derived from a base seed drawn
+    when the dataloader iterator is created, and the number of draws preceding that differs across
+    a resume boundary. `tests/test_resume.py` pins the schedule unconditionally and the full
+    trajectory at `num_workers=0`.
+    '''
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._pending_rng_states = None
+
+    def state_dict(self) -> dict:
+        return {"rng_states": _collect_rng_states()}
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        rng_states = state_dict.get("rng_states")
+        if not rng_states:
+            # A checkpoint written before this callback existed. Resuming is still correct for the
+            # schedule; only the RNG stream restarts. Say so rather than failing or staying quiet.
+            print("ResumeFidelity: checkpoint sem estado de RNG -- o cronograma retoma exato, "
+                  "o fluxo aleatorio reinicia.")
+            return
+        # Stashed, not applied: see `on_train_epoch_start`.
+        self._pending_rng_states = rng_states
+
+    def on_train_start(self, trainer, pl_module) -> None:
+        '''
+        Apply the restored RNG here, not in `load_state_dict`.
+
+        Two hooks look plausible and both are wrong. `load_state_dict` runs before Lightning has
+        finished restoring, and `on_train_epoch_start` does **not** fire when a run resumes in the
+        middle of an epoch -- the restore would silently land an epoch late, leaving the stream
+        phase-shifted by however many batches remained. `on_train_start` fires on every `fit`,
+        resumed or not, and before the epoch loop builds its data fetcher.
+
+        This is only exact because `DataModuleFromConfig` gives its DataLoader an explicit
+        `generator`: `_BaseDataLoaderIter.__init__` draws a `_base_seed` on every iterator creation,
+        and a resumed run creates an iterator where the uninterrupted run did not. Drawing that from
+        the loader's own generator keeps it out of the global stream.
+        '''
+        if self._pending_rng_states is None:
+            return
+        _set_rng_states(self._pending_rng_states)
+        self._pending_rng_states = None

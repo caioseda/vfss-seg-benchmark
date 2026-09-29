@@ -1,0 +1,52 @@
+# ACDC -- teste de aceitacao do port de SSL, e o gate da grade X1.
+#
+# Diferente das grades do VFSS, aqui os hiperparametros seguem a REFERENCIA (SSL4MIS: SGD 0.01 com
+# decaimento poly, 30k iteracoes, batch 6/3), porque o objetivo e comparabilidade com um numero
+# publicado e nao entre metodos.
+#
+#   scripts/submit.sh configs/sweep/acdc.yaml
+type: sweep
+name: acdc
+family: acdc
+plan: src.sweeps.acdc.ACDCSweep
+
+axes:
+  seed: [1337]              # a semente da referencia
+  # 1% e o numero de destaque do artigo (82.40 Dice) mas tambem o mais instavel -- o proprio artigo
+  # mostra 82.40 em validacao contra 71.85 em teste para a mesma configuracao. 5% e 10% discriminam
+  # DiffRect dos baselines com muito menos variancia. Para reproduzir a tabela inteira, acrescente "1%".
+  ratio: ["5%", "10%"]
+  backbone: [ssl4mis, repo]
+  method: [supervised, meanteacher, fixmatch, diffrect]
+
+base_configs:
+  supervised:  configs/experiment/acdc/acdc-unet-supervised.yaml
+  meanteacher: configs/experiment/acdc/acdc-unet-meanteacher.yaml
+  fixmatch:    configs/experiment/acdc/acdc-unet-fixmatch.yaml
+  diffrect:    configs/experiment/acdc/acdc-unet-diffrect.yaml
+
+# ABLACAO DE BACKBONE. Todo numero publicado de ACDC 2-D e medido na UNet do SSL4MIS: 1.81M
+# parametros, dropout de 0.05 a 0.5. A src.models.unet.UNet deste repositorio -- a que o X1 usa --
+# tem 17.26M e nenhum dropout, 9.5x maior. Reproduzir um numero trocando o backbone em silencio nao
+# seria reproducao; rodar so o nosso deixaria a diferenca ambigua entre "o port esta errado" e "a
+# arquitetura e outra". `null` = usar o backbone que o YAML ja traz (o da referencia).
+backbones:
+  ssl4mis: null
+  repo:
+    target: src.models.unet.UNet
+    params: {n_channels: 1, n_classes: 4, bilinear: true}
+
+training:
+  max_steps: 30000          # a referencia treina 30k iteracoes
+  val_every_n_steps: 500
+  batch_size: 6             # 6 por batch, 3 rotulados
+  labeled_batch_size: 3
+
+data:
+  root: /data_ssd/caioseda/data/ACDC
+
+evaluation:
+  num_classes: 4
+  class_ids: {1: RV, 2: Myo, 3: LV}   # ventriculo direito, miocardio, ventriculo esquerdo
+
+results_csv: results_per_volume.csv

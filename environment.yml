@@ -24,11 +24,23 @@ dependencies:
   - pytorch-lightning
   - torchmetrics
   - conda-forge::tensorboard
-  - conda-forge::mlflow
+  # mlflow NAO vem do conda-forge: o solver resolve para a 1.2.0 (de 2019), que e
+  # inutilizavel com um backend sqlite -- ela executa `session.execute("INSERT ...")` com
+  # string crua e o SQLAlchemy 2.x levanta ObjectNotExecutableError. Vem do pip, abaixo.
   - conda-forge::einops
   - pip:
     - omegaconf
-    - protobuf==3.20.*
+    # protobuf NAO e pinado. O `protobuf==3.20.*` que estava aqui era o contorno de 2022 para o
+    # erro `Descriptors cannot not be created directly` de um TensorBoard antigo, e ficou obsoleto:
+    # o tensorboard 2.20 nao pinga protobuf e `torch/utils/tensorboard` so checa tensorboard>=1.15.
+    # Pior, ele nao tem extensao C para cp312, entao TODA escrita de event file rodava no parser
+    # puro-Python -- e coexistia com o protobuf do conda, deixando dois dist-info para um pacote.
+    - 'mlflow>=3'
+    # Aim: UI alternativa ao TensorBoard, com consulta por hiperparametro. OPCIONAL e fora do
+    # caminho critico. ATENCAO: no 3.29.1 o backfill nao funciona -- `run[chave] = valor` e um
+    # no-op silencioso e nada persiste (ver `scripts/index_runs.py:assert_aim_persists`, que
+    # detecta isso e falha com o diagnostico em vez de gravar um indice vazio).
+    - aim
     - pytz 
     - timm==1.0.25
     # Only needed to PREPARE the ACDC reproduction data (scripts/prepare_acdc.py reads .nii.gz).

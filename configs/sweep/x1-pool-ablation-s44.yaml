@@ -1,0 +1,57 @@
+# Ablacao do pool nao rotulado do X1: teto 8000 + stride 3 (o que os sweeps x1-* usaram) contra o
+# pool denso do X1B (sem teto, stride 1). Mesma grade do x1-frames-per-video, restrita aos dois
+# extremos de orcamento e sem DiffRect (custa 2x por celula).
+#
+# Um arquivo por seed (s42/s43/s44), cada um com a sua familia: sweeps da mesma familia gravam a
+# mesma CSV e o mesmo estado, e nao podem rodar em paralelo. A analise fica em
+# notebooks/hyphotesis_testing/experiment_1c_pool_config_ablation.ipynb.
+#
+#   scripts/submit.sh configs/sweep/x1-pool-ablation-s44.yaml
+type: sweep
+name: x1-pool-ablation-s44
+family: x1-pool-ablation-s44
+plan: src.sweeps.x1.X1PoolAblationSweep
+run_name_prefix: x1-pool-abl
+
+# Ordem dos eixos = ordem em que as celulas rodam. `pool` e o mais interno, para que os dois bracos
+# de cada par fiquem adjacentes e uma grade interrompida deixe pares completos.
+axes:
+  seed: [44]
+  frames_per_video: [1, 5]
+  method: [supervised, fixmatch, meanteacher]
+  pool: [old, new]
+
+pools:
+  old: {unlabeled_pool_size: 8000, unlabeled_pool_frame_stride: 3}   # x1, x1-frames-per-video*, x1-binario
+  new: {unlabeled_pool_size: null, unlabeled_pool_frame_stride: 1}   # x1b
+
+base_configs:
+  supervised:  configs/experiment/x1/x1-unet-supervised.yaml
+  fixmatch:    configs/experiment/x1/x1-unet-fixmatch.yaml
+  meanteacher: configs/experiment/x1/x1-unet-meanteacher.yaml
+
+training:
+  max_steps: 8000
+  val_every_n_steps: 500
+  batch_size: 8
+  labeled_batch_size: 4
+  unlabeled_policy: same_video
+
+data:
+  dataset_path: /data_ssd/caioseda/data/dataset_inca_all_frames/
+  split_seed: 42
+  split_ratios: [0.7, 0.10, 0.2]
+  split_group_column: paciente_id
+  label_seed: 42
+  label_group_column: video_id
+  # Sobrescritos por celula pelo eixo `pool`; ficam aqui porque `_pool_params` os le.
+  unlabeled_pool_size: 8000
+  unlabeled_pool_frame_stride: 3
+  unlabeled_pool_seed: 42
+  unlabeled_pool_splits: [train]
+
+evaluation:
+  num_classes: 4
+  class_ids: {1: C2, 3: C4}
+
+results_csv: results_per_sample.csv

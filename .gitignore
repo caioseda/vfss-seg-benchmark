@@ -5,11 +5,31 @@
 lightning_logs/
 *fix_paths.ipynb
 
-logs/
-!logs/x1/
-!logs/x1b/
+# logs/ -- o registro cientifico (as CSVs de resultado) e versionado; runs, checkpoints,
+# predicoes e os stores dos trackers nao.
+#
+# A receita precisa ter exatamente esta forma. A versao anterior era
+#     logs/
+#     !logs/x1/
+# e nao funcionava: um diretorio excluido nunca e percorrido, entao nenhuma excecao abaixo
+# dele tem efeito -- `git ls-files logs` devolvia 0 arquivos, apesar da intencao clara de
+# versionar as CSVs. Ignorar o CONTEUDO (`logs/*`) e reincluir os diretorios (`!logs/*/`) e o
+# que permite as excecoes de nivel 2 valerem.
+logs/*
+!logs/*/
+logs/*/*
+!logs/*/results_*.csv
+*.ckpt
 
+# Pastas reservadas: nunca versionadas, nem uma CSV dentro delas.
+logs/_archive/
+logs/_tracking/
+logs/_migration/
 
-mlrus/*
+# Store do MLflow criado relativo ao CWD pelas versoes 1.x/2.x, mesmo sem artefatos.
+# (O typo `mlrus/*` da versao anterior nunca ignorou nada.)
+mlruns/
+nohup.out
+
 *.bin
 *.pth

@@ -112,6 +112,10 @@ class TwoStreamBatchSampler(Sampler[List[int]]):
         self.unlabeled_policy = unlabeled_policy
         self.temporal_window = temporal_window
         self._epoch = 0  # bumped each __iter__ call, folded into the per-epoch shuffle seed
+        # Position within the epoch, so a crashed run can resume where it stopped rather than
+        # restarting the epoch. See `state_dict`.
+        self._next_batch_idx = 0
+        self._resume_batch_idx = 0
 
         self._unlabeled_array = np.asarray(self.unlabeled_indices, dtype=np.int64)
 
@@ -245,14 +249,55 @@ class TwoStreamBatchSampler(Sampler[List[int]]):
             return np.random.RandomState()
         return np.random.RandomState(self.seed + self._epoch)
 
+    def state_dict(self) -> dict:
+        '''
+        Where the stream is, so `trainer.fit(ckpt_path=...)` resumes the epoch instead of
+        restarting it. Lightning restores the model, the optimizer, the scheduler and
+        `global_step`, but it does not rewind a dataloader unless the sampler says where it was.
+
+        `_next_batch_idx` is set *before* each yield, so while the consumer is training on batch i
+        -- which is when a checkpoint gets written -- this already reads i+1, the batch to serve
+        next. `draw_counts` rides along because `draw_report` (what X1B reports the policy split
+        on) would otherwise be reset by a resume.
+        '''
+        return {
+            "epoch": self._epoch,
+            "next_batch_idx": self._next_batch_idx,
+            "draw_counts": dict(self.draw_counts),
+        }
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        self._epoch = int(state_dict.get("epoch", 0))
+        self._resume_batch_idx = int(state_dict.get("next_batch_idx", 0))
+        self.draw_counts = Counter(state_dict.get("draw_counts", {}))
+
     def __iter__(self) -> Iterator[List[int]]:
         rng = self._epoch_rng()
         labeled_order = self.labeled_indices if not self.shuffle else rng.permutation(self.labeled_indices).tolist()
 
         n_batches = len(labeled_order) // self.labeled_batch_size
-        for batch_idx in range(n_batches):
+
+        # Fast-forward after a resume. The skipped draws have to be REPLAYED, not jumped over:
+        # `rng` is consumed by `_draw_unlabeled` on every batch, so seeking straight to
+        # `_resume_batch_idx` would leave the stream at the wrong position and the resumed epoch
+        # would pair different unlabeled frames than the uninterrupted one would have. The replay
+        # is a few thousand cheap numpy draws. `draw_counts` is rewound afterwards so it does not
+        # double-count.
+        resume_from = min(self._resume_batch_idx, n_batches)
+        self._resume_batch_idx = 0
+        if resume_from:
+            counts_before = Counter(self.draw_counts)
+            for batch_idx in range(resume_from):
+                start = batch_idx * self.labeled_batch_size
+                self._draw_unlabeled(labeled_order[start:start + self.labeled_batch_size], rng)
+            self.draw_counts = counts_before
+
+        for batch_idx in range(resume_from, n_batches):
             start = batch_idx * self.labeled_batch_size
             labeled_batch = labeled_order[start:start + self.labeled_batch_size]
-            yield labeled_batch + self._draw_unlabeled(labeled_batch, rng)
+            batch = labeled_batch + self._draw_unlabeled(labeled_batch, rng)
+            self._next_batch_idx = batch_idx + 1
+            yield batch
 
         self._epoch += 1
+        self._next_batch_idx = 0

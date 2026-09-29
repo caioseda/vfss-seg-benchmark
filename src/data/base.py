@@ -34,6 +34,9 @@ def seed_worker(worker_id: int) -> None:
     random.seed(seed + worker_id)
 
 
+_LOADER_GENERATOR_SEED = 0
+
+
 class DataModuleFromConfig(pl.LightningDataModule):
     """Simple configurable datamodule for train/val/test/predict datasets."""
 
@@ -82,6 +85,13 @@ class DataModuleFromConfig(pl.LightningDataModule):
         self.datasets: Dict[str, Any] = {}
         self.train_batch_sampler_config = train_batch_sampler
         self._train_batch_sampler = None
+        self._pending_sampler_state: Optional[Dict[str, Any]] = None
+        # The DataLoader gets its own generator so that creating an iterator -- which draws a
+        # `_base_seed` every time -- does not consume the global RNG stream. Without this, a
+        # resumed run is permanently one draw ahead of the uninterrupted one and every
+        # augmentation downstream differs. See `src.callbacks.ResumeFidelity`.
+        self._loader_generator = torch.Generator()
+        self._loader_generator.manual_seed(_LOADER_GENERATOR_SEED)
 
     def _build_dataset_config(self, dataset_cfg: Dict[str, Any]) -> Dict[str, Any]:
         cfg = copy.deepcopy(dataset_cfg)
@@ -151,6 +161,39 @@ class DataModuleFromConfig(pl.LightningDataModule):
 
                 sampler_cfg["params"] = params
                 self._train_batch_sampler = instantiate_from_config(sampler_cfg)
+                pending = getattr(self, "_pending_sampler_state", None)
+                if pending:
+                    self._train_batch_sampler.load_state_dict(pending)
+                    self._pending_sampler_state = None
+
+    # ------------------------------------------------------------------ resume
+
+    def state_dict(self) -> Dict[str, Any]:
+        '''
+        Carries the train batch sampler's position into the checkpoint, so `ckpt_path=` resumes the
+        epoch where it stopped instead of restarting it. Lightning already saves and reloads the
+        DataModule's `state_dict` (`_CheckpointConnector.dump_checkpoint` / `restore_datamodule`),
+        so delegating here is all it takes.
+        '''
+        sampler = self._train_batch_sampler
+        if sampler is None or not hasattr(sampler, "state_dict"):
+            return {}
+        return {"train_batch_sampler": sampler.state_dict(),
+                "loader_generator": self._loader_generator.get_state()}
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        generator_state = (state_dict or {}).get("loader_generator")
+        if generator_state is not None:
+            self._loader_generator.set_state(generator_state)
+        sampler_state = (state_dict or {}).get("train_batch_sampler")
+        if not sampler_state:
+            return
+        sampler = self._train_batch_sampler
+        if sampler is not None and hasattr(sampler, "load_state_dict"):
+            sampler.load_state_dict(sampler_state)
+        else:
+            # `setup` has not built the sampler yet: hold the state and apply it when it appears.
+            self._pending_sampler_state = sampler_state
 
     def _make_loader(self, split: str, shuffle: bool) -> DataLoader:
         if split not in self.datasets:
@@ -160,6 +203,7 @@ class DataModuleFromConfig(pl.LightningDataModule):
             return DataLoader(
                 self.datasets[split],
                 batch_sampler=self._train_batch_sampler,
+            generator=self._loader_generator,
                 num_workers=self.num_workers,
                 pin_memory=True,
                 worker_init_fn=seed_worker if self.use_worker_init_fn else None,
@@ -170,6 +214,7 @@ class DataModuleFromConfig(pl.LightningDataModule):
             batch_size=self.batch_size,
             num_workers=self.num_workers,
             shuffle=shuffle,
+            generator=self._loader_generator,
             pin_memory=True,
             worker_init_fn=seed_worker if self.use_worker_init_fn else None,
         )

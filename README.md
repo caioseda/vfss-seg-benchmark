@@ -104,6 +104,55 @@ over a stack is a different quantity from the volumetric Dice the ACDC literatur
 ASD are reimplemented on `scipy.ndimage` rather than taken from `medpy` (GPL-3.0), so they are
 implementation-comparable rather than bit-identical to the published millimetre figures.
 
+## Running experiments
+
+Experiments are run from the CLI, not from a notebook: a dropped SSH connection used to kill the
+training loop, and without checkpoint resume the grid cell restarted from zero.
+
+```bash
+scripts/submit.sh configs/sweep/x1.yaml     # detached tmux session; returns immediately
+tmux attach -t x1                           # Ctrl-b d detaches without killing
+tail -f logs/x1/_sweep/console.log
+python scripts/run_sweep.py --config configs/sweep/x1.yaml --dry-run   # what is pending
+```
+
+Relaunching after a crash is the expected workflow and is safe. Resume works at two levels:
+completed cells are skipped (the source of truth is the family's results CSV, the same one the
+notebooks write), and a cell interrupted mid-run resumes from `checkpoints/last.ckpt` with the
+schedule -- LR, consistency weight, EMA decay -- exactly where it was. `tests/test_resume.py` pins
+that against an uninterrupted run and ablates each piece.
+
+A sweep is a grid: `configs/sweep/<name>.yaml` holds the values, `src/sweeps/` the logic that
+depends on the label regime (converting `val_every_n_steps` into `check_val_every_n_epoch` needs the
+count of revealed labels). `tests/test_sweeps.py` asserts, against the `hparams.yaml` of every
+already-completed run, that the config generated today is the one that produced that row of the CSV
+-- so moving the grid out of the notebooks cannot silently make new results incomparable with old.
+
+### Logs and TensorBoard
+
+```
+logs/<family>/
+    results_*.csv        the scientific record (versioned)
+    predictions/*.npz    prediction cache, keyed by run_id
+    runs/<name>/<uid>/   config.yaml  run.json  console.log
+                         tensorboard/  csv/metrics.csv  checkpoints/
+logs/_archive/           closed eras; nothing deleted
+```
+
+`logs/<family>/runs/` holds **exactly** the runs that family's results CSV references, so:
+
+```bash
+tensorboard --logdir logs/x1/runs
+tensorboard --logdir_spec 4cls:logs/x1-frames-per-video/runs,8cls:logs/x1-frames-per-video-multiclass-all/runs
+```
+
+`scripts/migrate_logs.py` performed the one-off reorganisation (`--dry-run` by default, reversible
+through a manifest). `scripts/index_runs.py` indexes runs into MLflow without copying artefacts --
+the run directory stays the only canonical copy.
+
+Design decisions behind all of this, including what was measured and what turned out to be broken,
+are in [`docs/mlops-execucao-e-tracking.md`](docs/mlops-execucao-e-tracking.md).
+
 ## Tests
 
 ```bash

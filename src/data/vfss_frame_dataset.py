@@ -15,7 +15,7 @@ from typing import Sequence, Union, Optional
 logger = logging.getLogger(__name__)
 
 TARGET_TYPES = ("mask", "points")
-TARGET_VARIANTS = ("raw", "binary_c2_c4", "multiclass_c2_c4", "multiclass_all")
+TARGET_VARIANTS = ("raw", "binary_c2_c4", "binary_all", "multiclass_c2_c4", "multiclass_all")
 SPLIT_NAMES = ("train", "val", "test")
 DEFAULT_SPLIT_RATIOS = (0.7, 0.10, 0.2)
 
