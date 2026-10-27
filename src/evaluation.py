@@ -137,3 +137,71 @@ def aggregate_per_class(per_sample: pd.DataFrame, group_columns: Sequence[str] =
     )
     counts = per_sample.groupby(keys, dropna=False).size().rename("n_samples").reset_index()
     return aggregated.merge(counts, on=keys)
+
+
+def aggregate_per_patient(per_sample: pd.DataFrame, group_columns: Sequence[str] = (),
+                          patient_column: str = "paciente_id") -> pd.DataFrame:
+    '''
+    The article protocol's aggregation: average the frames of each patient first, then the patients.
+
+    `aggregate_per_class` averages frames directly, so a patient with 60 annotated frames weighs 15x
+    one with 4 -- and in INCA 15 of 114 patients hold most of the frames. Here every patient counts
+    once. Within a patient the reduction is the same `nanmean` as `aggregate_per_class`, so a frame
+    where the class is absent from both prediction and target still drops out of Dice/IoU.
+
+    Returns one row per `group_columns + class` with the four metrics, `n_patients` and `n_samples`.
+    '''
+    keys = list(group_columns) + ["class"]
+    per_patient = aggregate_per_class(per_sample, group_columns=list(group_columns) + [patient_column])
+    aggregated = (
+        per_patient
+        .groupby(keys, dropna=False)[list(METRIC_NAMES)]
+        .mean()   # pandas' mean skips NaN: a patient whose class is undefined everywhere drops out
+        .reset_index()
+    )
+    counts = (
+        per_patient.groupby(keys, dropna=False)
+        .agg(n_patients=(patient_column, "nunique"), n_samples=("n_samples", "sum"))
+        .reset_index()
+    )
+    return aggregated.merge(counts, on=keys)
+
+
+def summarize_over_folds(per_fold: pd.DataFrame, group_columns: Sequence[str],
+                         fold_column: str = "fold",
+                         metrics: Sequence[str] = METRIC_NAMES) -> pd.DataFrame:
+    '''
+    Mean and sample standard deviation (ddof=1) across folds, one row per `group_columns + class`.
+
+    The spread measures sensitivity to the partition. The folds share training patients, so they are
+    not independent replicates and the std is not a standard error.
+    '''
+    keys = list(group_columns) + ["class"]
+    grouped = per_fold.groupby(keys, dropna=False)
+    summary = grouped[list(metrics)].agg(["mean", "std"])
+    summary.columns = [f"{metric}_{stat}" for metric, stat in summary.columns]
+    summary["n_folds"] = grouped[fold_column].nunique()
+    return summary.reset_index()
+
+
+def paired_fold_differences(per_fold: pd.DataFrame, by: str, reference,
+                            fold_column: str = "fold", group_columns: Sequence[str] = (),
+                            metrics: Sequence[str] = METRIC_NAMES) -> pd.DataFrame:
+    '''
+    Per-fold difference of every level of `by` against `reference`, matched on the same fold, class
+    and `group_columns` (e.g. seed). Positive means higher than the reference -- better for Dice/IoU,
+    worse for ASSD/HD95 (see `METRIC_DIRECTION`).
+
+    Returns the per-fold differences; reduce them with `summarize_over_folds(diffs, [by, ...])`.
+    '''
+    keys = [fold_column, "class"] + list(group_columns)
+    reference_rows = per_fold[per_fold[by] == reference]
+    if reference_rows.empty:
+        raise ValueError(f"No rows with {by}={reference!r} to use as the reference.")
+    merged = per_fold[per_fold[by] != reference].merge(
+        reference_rows[keys + list(metrics)], on=keys, suffixes=("", "_reference"), how="inner",
+    )
+    for metric in metrics:
+        merged[metric] = merged[metric] - merged[f"{metric}_reference"]
+    merged["reference"] = reference
+    return merged[[by, "reference"] + keys + list(metrics)]

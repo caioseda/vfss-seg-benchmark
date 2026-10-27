@@ -1,0 +1,57 @@
+# E1 / tuning A.1 -- lr e weight_decay por arquitetura, com Optuna RandomSampler de seed fixa.
+# Protocolo: plano_experimental_artigo_atualizado_2026-10-22.md, secao 2.2 (A.1).
+#
+#   scripts/submit.sh configs/sweep/e1-tuning.yaml
+#
+# Treina SO no fold 0 do desenvolvimento (~16 pacientes), seleciona pelo Dice medio por paciente na
+# validacao fixa e nao carrega teste nenhum. Cada celula grava as linhas por frame da VALIDACAO
+# (eval_set=val) em logs/e1-tuning/results_per_sample.csv. Depois: notebooks/artigo/e1_arquiteturas/
+# e1_01_tuning.ipynb escolhe o melhor trial e congela configs/frozen/e1-hparams.yaml.
+type: sweep
+name: e1-tuning
+family: e1-tuning
+plan: src.sweeps.e1.E1TuningSweep
+
+# Ordem dos eixos = ordem das celulas. `trial` mais externo: se o orcamento for cortado, todas as
+# arquiteturas ficam com o mesmo numero de trials.
+axes:
+  seed: [42]
+  trial: [0, 1, 2, 3, 4, 5, 6, 7]
+  arch: [unet, unetplusplus, fpn, deeplabv3plus, swinunet_tiny]
+
+base_configs:
+  unet:          configs/experiment/e1/e1-unet.yaml
+  unetplusplus:  configs/experiment/e1/e1-unetplusplus.yaml
+  fpn:           configs/experiment/e1/e1-fpn.yaml
+  deeplabv3plus: configs/experiment/e1/e1-deeplabv3plus.yaml
+  swinunet_tiny: configs/experiment/e1/e1-swinunet-tiny.yaml
+
+search_space:
+  sampler_seed: 42
+  n_trials: 8
+  # A ORDEM das chaves faz parte da semente (o sampler sorteia nessa ordem).
+  params:
+    lr:           {low: 1.0e-5, high: 1.0e-3, log: true}
+    weight_decay: {low: 1.0e-6, high: 1.0e-3, log: true}
+  # Pontos fixos, avaliados ANTES dos sorteados (e somados aos indices de `trial`). Vazio por padrao.
+  # Ex.: [{lr: 1.0e-3, weight_decay: 1.0e-4}] inclui a referencia atual; acrescente o indice em `axes.trial`.
+  fixed_trials: []
+
+training:
+  max_steps: 8000
+  val_every_n_steps: 500   # vira trainer.val_check_interval
+  batch_size: 4            # 4 rotulados por passo
+
+data:
+  split_file: configs/splits/inca-protocolo-s42.csv
+  train_folds: [0]
+
+# Opcional (confirmacao "duas melhores em quatro folds"): copie este arquivo com outro `family`/`name`,
+# troque `data.train_folds` por [1, 2, 3, 4] e restrinja a grade com
+#   candidates: {unet: [3, 5], fpn: [0, 2], ...}
+
+evaluation:
+  num_classes: 2
+  class_ids: {1: FG}   # 0=fundo, 1=estrutura (C2..C8 fundidas por binary_all)
+
+results_csv: results_per_sample.csv

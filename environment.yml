@@ -43,6 +43,11 @@ dependencies:
     - aim
     - pytz 
     - timm==1.0.25
+    # Encoders ResNet34/ImageNet + decoders U-Net/U-Net++/FPN/DeepLabv3+ do E1 (src/models/smp_adapters.py).
+    # Os pesos ImageNet sao baixados no primeiro uso e ficam no cache do torch/hf.
+    - segmentation-models-pytorch==0.5.0
+    # So o RandomSampler, para amostrar os pontos do tuning A.1 (src/tuning.py).
+    - optuna==4.9.0
     # Only needed to PREPARE the ACDC reproduction data (scripts/prepare_acdc.py reads .nii.gz).
     # Training and evaluation never import it.
     - nibabel

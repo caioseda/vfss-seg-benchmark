@@ -74,3 +74,43 @@ class OutConv(nn.Module):
 
     def forward(self, x):
         return self.conv(x)
+
+
+INPUT_NORMALIZATIONS = (None, "imagenet")
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+
+
+class InputNormalization(nn.Module):
+    '''
+    Map the dataset's `[-1, 1]` images to what a pretrained encoder was trained on.
+
+    `VFSSFrameDatasetBase._preprocess_image` min-max scales each frame to `[-1, 1]`, and that stays
+    the dataset contract for every model. An ImageNet-pretrained encoder instead expects `[0, 1]`
+    standardised by the ImageNet channel statistics, so the conversion lives in the model adapter,
+    on the model's side of the contract, and only models that ask for it get it.
+
+    `mode=None` is the identity. The buffers are non-persistent, so wrapping a model in this never
+    changes its `state_dict` keys and older checkpoints keep loading.
+    '''
+
+    def __init__(self, mode=None):
+        super().__init__()
+        if mode not in INPUT_NORMALIZATIONS:
+            raise ValueError(f"input_normalization must be one of {INPUT_NORMALIZATIONS}, got {mode!r}")
+        self.mode = mode
+        imagenet_mean = torch.tensor(IMAGENET_MEAN).view(1, 3, 1, 1)
+        imagenet_std = torch.tensor(IMAGENET_STD).view(1, 3, 1, 1)
+        
+        if mode == "imagenet":
+            self.register_buffer("mean", imagenet_mean, persistent=False)
+            self.register_buffer("std", imagenet_std, persistent=False)
+
+    def forward(self, x):
+        if self.mode is None:
+            return x
+
+        x_normalized = (x + 1.0) / 2.0  # [-1, 1] -> [0, 1]
+        x_standardized = (x_normalized - self.mean) / self.std  # [0, 1] -> ImageNet standardization
+        return x_standardized
+        

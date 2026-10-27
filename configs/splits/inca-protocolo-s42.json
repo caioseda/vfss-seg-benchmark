@@ -1,0 +1,81 @@
+{
+  "seed": 42,
+  "ratios_dev_val_test": [
+    0.7,
+    0.1,
+    0.2
+  ],
+  "ratios_unit": "patients",
+  "n_folds": 5,
+  "stratified_by": "n_videos > 1 (multi_video) vs 1 (single_video)",
+  "source_table": "/data_ssd/caioseda/data/dataset_inca_all_frames/inca-video-frame-dataset.csv",
+  "source_sha256": "4eec87f7d1329105f0fe88b9cc064979cfae126b7b9cda7167303c5f281032da",
+  "git_sha": "803dccc732a5477160fa58f829ac75d2755a96be",
+  "created_at": "2026-10-23T15:18:43",
+  "counts": [
+    {
+      "partition": "dev",
+      "fold": null,
+      "patients": 80,
+      "multi_video_patients": 10,
+      "videos": 150,
+      "frames": 612
+    },
+    {
+      "partition": "val",
+      "fold": null,
+      "patients": 11,
+      "multi_video_patients": 2,
+      "videos": 26,
+      "frames": 110
+    },
+    {
+      "partition": "test",
+      "fold": null,
+      "patients": 23,
+      "multi_video_patients": 3,
+      "videos": 56,
+      "frames": 239
+    },
+    {
+      "partition": "dev",
+      "fold": 0,
+      "patients": 16,
+      "multi_video_patients": 2,
+      "videos": 27,
+      "frames": 121
+    },
+    {
+      "partition": "dev",
+      "fold": 1,
+      "patients": 16,
+      "multi_video_patients": 2,
+      "videos": 29,
+      "frames": 117
+    },
+    {
+      "partition": "dev",
+      "fold": 2,
+      "patients": 16,
+      "multi_video_patients": 2,
+      "videos": 30,
+      "frames": 127
+    },
+    {
+      "partition": "dev",
+      "fold": 3,
+      "patients": 16,
+      "multi_video_patients": 2,
+      "videos": 31,
+      "frames": 124
+    },
+    {
+      "partition": "dev",
+      "fold": 4,
+      "patients": 16,
+      "multi_video_patients": 2,
+      "videos": 33,
+      "frames": 123
+    }
+  ]
+}

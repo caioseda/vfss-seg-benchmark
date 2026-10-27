@@ -131,31 +131,103 @@ descartado porque exige `import tensorflow` e, sem ele, **falha em silêncio**.
 
 ### Estado dos dois backends
 
-**MLflow — código pronto, instalação pendente.** O bloqueador nunca foi o MLflow: era o pin
-`protobuf==3.20.*`. Subir para `mlflow>=3` arrasta `opentelemetry-proto`, que exige `protobuf>=5`.
-Já removido do `environment.yml`; aplicar quando a GPU estiver livre, porque substituir o protobuf
-sob um treino em andamento pode quebrá-lo:
+**MLflow — instalado, ligado por padrão, ao vivo e retroativo.** O bloqueador nunca foi o MLflow:
+era o pin `protobuf==3.20.*`, que `mlflow>=3` forçaria a subir via `opentelemetry-proto`. Removido do
+`environment.yml`. Os 230 runs do acervo foram indexados (638.259 pontos), e os runs novos chegam ao
+MLflow **durante o treino**, sem passo manual.
 
 ```bash
-pip install 'mlflow>=3'          # remove o pin antigo do protobuf de tabela
-python scripts/index_runs.py --backend mlflow
 mlflow ui --backend-store-uri sqlite:///logs/_tracking/mlflow.db
+python scripts/index_runs.py --verify
 ```
+
+Quais trackers acompanham o treino é decidido em **um** arquivo, `configs/tracking.yaml`, com
+precedência `defaults em src/tracking.py < configs/tracking.yaml < bloco logging: do YAML do
+experimento`. `VFSS_TRACKING=off` desliga tudo sem editar nada.
+
+Três propriedades do tracking ao vivo, cada uma com um teste que **falha se ela for removida**
+(`tests/test_tracking.py`, verificado por ablação):
+
+- **Mesma identidade do indexador.** O tag `run_uid` é `sha1(caminho relativo a logs/)` nos dois
+  lados, calculado pela mesma função. Se divergissem, o backfill não reconheceria o run logado ao
+  vivo e o reindexaria: o mesmo treino apareceria duas vezes.
+- **Retomada continua o mesmo run.** Uma retomada reabre o mesmo diretório e portanto o mesmo
+  `run_uid`; o logger procura o run existente por tag e o reaproveita. Sem isso cada tentativa abriria
+  um run novo para o que é um único treino.
+- **O tracker nunca derruba o treino.** Uma exceção do backend (banco travado, disco cheio) dentro de
+  `log_metrics` interromperia um treino de horas por algo que não é o experimento. Cada falha é
+  avisada (as três primeiras) e contada, e o run segue; a fonte da verdade continua sendo o
+  `csv/metrics.csv`. Um tracker que não consegue nem ser *construído* (não instalado, URI inválida) é
+  pulado com um aviso. Para reparar um run cujo tracker falhou no meio:
+  `python scripts/index_runs.py --replace --family <família>`.
+
+**O número publicado.** Só nasce no `evaluate()`, depois de os loggers fecharem, então um run logado
+ao vivo não o teria. O `Sweep` o anexa ao run do MLflow assim que a linha entra na CSV de resultado
+(`attach_published_metrics`), e `index_runs.py` o completa em qualquer run que ainda não o tenha — o
+que também cobre runs cuja CSV foi escrita depois.
 
 Nos notebooks, use `mlflow.search_runs(..., output_format="list")` ou `MlflowClient.search_runs()`
 enquanto `mlflow/mlflow#22349` (suporte a pandas 3.x) estiver aberto.
 
-**Aim — não funciona nesta versão.** Medido no `aim 3.29.1` / `aimrocks 0.5.2`: o run é criado (o
-hash e o `name` persistem) mas **params e métricas não**. `run[chave] = valor` é um no-op silencioso,
-porque `aim/ext/exception_resistant.py` engole a exceção; `repo.iter_runs()` devolve zero, e
-`Run.metrics()` volta vazio após reabrir. Consequência prática: indexar *parecia* funcionar,
-escrevia ~76 MB de chunks por 16 runs e produzia um índice vazio — e, como a idempotência não via
-nada, cada passada duplicava tudo.
+### Abrindo a interface do MLflow (principalmente por túnel)
 
-`assert_aim_persists()` escreve um run descartável e o lê de volta **antes** de indexar 186 runs, e
-aborta com esse diagnóstico. Se um Aim futuro corrigir o problema, a checagem passa e o caminho volta
-a funcionar sem mudança. Contexto: o último release do Aim é de 2025-05-08 e a questão de manutenção
-(`aimhubio/aim#3414`) segue sem resposta. Por isso `--backend` tem `mlflow` como padrão.
+```bash
+python scripts/mlflow_ui.py            # sobe o mlflow ui + um proxy; imprime um link por experimento
+# no seu computador:  ssh -L 5000:127.0.0.1:5000 usuario@servidor   ->   http://localhost:5000
+```
+
+Três coisas, todas reproduzidas contra o MLflow 3.16.1 desta máquina, fazem a interface parecer
+quebrada quando não está:
+
+1. **Ela abre em "GenAI", que está vazia para estes experimentos.** O MLflow 3.x tem uma chave no
+   canto superior esquerdo, "GenAI | Model training", e abre na primeira: `Overview` com "Traces 0 ·
+   No data available". Os runs de treino estão em **"Model training"** (URL `…/runs?workflowType=
+   machine_learning`). A escolha fica no `localStorage` do navegador, então vale por navegador;
+   o lançador imprime links que já caem na visão certa.
+2. **O servidor não comprime nada.** A página de runs baixa ~8,5 MB (`main.js` 4,4 MB, um chunk de
+   1,15 MB, 0,83 MB de CSS). Por um túnel lento isso é o "carregando para sempre"; os estáticos têm
+   cache de 28 dias, então o peso é só da primeira visita — e se ela nunca termina o cache nunca
+   enche. Pelo proxy a mesma página baixa **2,1 MB**.
+3. **POSTs com `Origin` que não seja `localhost` levam 403.** O middleware de segurança responde
+   "Cross-origin request blocked" e `runs/search` e `experiments/search` são POSTs. Num túnel
+   `ssh -L` o Origin é `http://localhost:PORTA` e passa; num túnel público (`https://…devtunnels.ms`,
+   ngrok, cloudflared) a lista de experimentos carrega (GET) e a tabela de runs fica vazia. O proxy
+   reescreve `Origin`/`Referer`, então funciona seja qual for o túnel. Para confirmar sem o proxy:
+   aba *Network* do navegador, status 403 em `runs/search`.
+
+O proxy (`src/mlflow_proxy.py`) só repassa HTTP e não conhece o MLflow, então não depende de nenhum
+detalhe interno dele. Os testes (`tests/test_mlflow_proxy.py`) rodam contra um servidor falso que
+**reproduz o 403**, de modo que um teste prova que é o proxy que o contorna, e cada proteção foi
+verificada por ablação.
+
+**As datas dos runs retro-indexados.** O backfill cria o run no instante em que indexa. Sem tratamento,
+a interface mostrava "Created: 5 hours ago" e "Duration: 1.7s" para um treino que durou 48 min e
+aconteceu semanas antes, e o eixo de tempo dos gráficos caía em 1970. `run_time_span` reconstrói o
+início de `run.json` (runs novos) ou do timestamp no nome do diretório, e o fim do `finished_at` ou
+da data do último arquivo de métrica; os timestamps das métricas são interpolados entre os dois
+(aproximação: serve para ordenar e dar a escala, não para medir a duração de um passo). Runs
+indexados antes dessa correção continuam com a data errada até serem reindexados:
+
+```bash
+python scripts/index_runs.py --replace --family x1    # um experimento
+python scripts/index_runs.py --replace                # todos
+```
+
+`--replace` faz soft-delete do run antigo e cria um novo, então o banco cresce até um `mlflow gc`.
+Rode `mlflow gc` com cuidado: ele apaga **todos** os runs soft-deletados do banco, inclusive os que você
+tenha apagado na interface de propósito; `mlflow gc --run-ids <ids>` apaga só os listados.
+
+**Aim — não funciona nesta versão, e fica desligado.** Medido no `aim 3.29.1` / `aimrocks 0.5.2`: o
+run é criado (o hash e o `name` persistem) mas **params e métricas não**. `run[chave] = valor` é um
+no-op silencioso, porque `aim/ext/exception_resistant.py` engole a exceção; `repo.iter_runs()`
+devolve zero, e `Run.metrics()` volta vazio após reabrir. Consequência prática: indexar *parecia*
+funcionar, escrevia ~76 MB de chunks por 16 runs e produzia um índice vazio — e, como a idempotência
+não via nada, cada passada duplicava tudo.
+
+`assert_aim_persists()` escreve um run descartável e o lê de volta **antes** de indexar, e aborta com
+esse diagnóstico; ligar `aim.enabled` no treino ao vivo imprime o mesmo aviso. Se um Aim futuro
+corrigir o problema, a checagem passa e o caminho volta a funcionar sem mudança. Contexto: o último
+release do Aim é de 2025-05-08 e a questão de manutenção (`aimhubio/aim#3414`) segue sem resposta.
 
 ## Notebooks: submeter e observar
 

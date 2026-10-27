@@ -1,0 +1,23 @@
+# Quais trackers acompanham cada treino. UM arquivo decide, em vez de 40 YAMLs de experimento.
+#
+# Precedencia, da menor para a maior:
+#   defaults em src/tracking.py  <  este arquivo  <  bloco `logging:` do YAML do experimento
+# `VFSS_TRACKING=off` desliga todos sem editar nada.
+#
+# O diretorio de run (`logs/<familia>/runs/<nome>/<uid>/`) e a unica copia canonica de checkpoints,
+# event files e CSV. Os trackers sao um INDICE sobre ele: guardam params e a serie escalar, mais uma
+# tag `run_dir` que aponta de volta. Nenhum artefato e copiado.
+#
+# Um tracker falhando NAO derruba o treino (a falha e avisada e contada), e um run retomado
+# continua o MESMO run do MLflow em vez de abrir outro.
+#
+# {logs} e substituido pela raiz de logs/ do repositorio.
+mlflow:
+  enabled: true
+  tracking_uri: sqlite:///{logs}/_tracking/mlflow.db
+
+# Desligado: o Aim 3.29.1 cria o run mas NAO persiste params nem metricas, e `run[chave] = valor` e
+# um no-op silencioso. Ver scripts/index_runs.py:assert_aim_persists.
+aim:
+  enabled: false
+  repo: "{logs}/_tracking/aim"

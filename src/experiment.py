@@ -11,9 +11,9 @@ import pytorch_lightning as pl
 import torch
 from omegaconf import DictConfig, OmegaConf
 from pytorch_lightning.callbacks import ModelCheckpoint
-from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
 
 from src.callbacks import OverallTrainingProgressBar, ResumeFidelity, build_callbacks
+from src.tracking import build_loggers, infer_logs_root, resolve_tracking_config
 from src.models import LitWrapper
 from src.utils import (
     instantiate_from_config,
@@ -81,6 +81,9 @@ class Experiment:
         self.data_module: Optional[pl.LightningDataModule] = None
         self.best_checkpoint_path: Optional[str] = None
         self.resumed_from_step: Optional[int] = None
+        # Preenchidos por `setup_loggers`; o `Sweep` os usa para anexar o numero publicado.
+        self.tracking_config: Dict[str, Any] = {}
+        self.tracking_logs_root: Optional[Path] = None
 
 
     def setup_exeperiment_run_dir(self) -> None:
@@ -112,32 +115,46 @@ class Experiment:
         return config
 
 
+    def _logs_root(self) -> Path:
+        '''
+        Raiz de `logs/`, da qual sai a identidade relativa de cada run (`run_uid_for`) -- a MESMA que o
+        indexador calcula, e por isso precisa concordar com `discover_runs`.
+        '''
+        if self.running_as_benchmark:
+            return infer_logs_root(self.experiment_run_dir, fallback=self.parent_dir)
+        return Path(self.parent_dir).resolve()
+
     def setup_loggers(self) -> List[Any]:
         '''
         Run loggers. TensorBoard + CSV always, so every run leaves a self-contained record on disk
-        next to its checkpoints; an optional `logging.loggers` block in the YAML appends others
-        (MLflow, W&B, ...) without touching this file:
+        next to its checkpoints. MLflow is added when enabled (it is, by default); Aim is off by
+        default because its 3.29.1 release does not persist what it is given.
+
+        Which trackers run is decided in ONE place, `configs/tracking.yaml` (defaults live in
+        `src.tracking.DEFAULT_TRACKING`), and may be overridden per experiment with a `logging:`
+        block. `VFSS_TRACKING=off` turns every tracker off without editing anything. The old
+        `logging.loggers` list keeps working and appends arbitrary extra loggers:
 
             logging:
+              mlflow: {enabled: false}
               loggers:
-                - target: pytorch_lightning.loggers.MLFlowLogger
-                  params:
-                    experiment_name: x1
-                    tracking_uri: file:./mlruns
+                - target: pytorch_lightning.loggers.WandbLogger
 
-        The CSV logger is what makes a sweep analysable offline: `metrics.csv` per run reads
-        straight into pandas, which TensorBoard event files do not.
+        The trackers are an INDEX over this run's directory, never a copy of it, and a tracker
+        failing must not kill a training run -- see `src.tracking`. The CSV logger remains the source
+        of truth: `metrics.csv` per run reads straight into pandas, which event files do not.
         '''
-        save_dir = str(self.experiment_run_dir)
-        loggers: List[Any] = [
-            TensorBoardLogger(save_dir=save_dir, name="", version="tensorboard"),
-            CSVLogger(save_dir=save_dir, name="", version="csv"),
-        ]
-
-        extra_loggers = self.config.get("logging", {}).get("loggers", []) or []
-        for logger_cfg in extra_loggers:
-            loggers.append(instantiate_from_config(logger_cfg))
-        return loggers
+        logs_root = self._logs_root()
+        self.tracking_logs_root = logs_root
+        self.tracking_config = resolve_tracking_config(logs_root, self.config.get("logging"))
+        return build_loggers(
+            run_dir=self.experiment_run_dir,
+            logs_root=logs_root,
+            run_name=self.experiment_name,
+            logging_cfg=self.tracking_config,
+            metadata={"git": self._git_info(), "config_path": str(self.config_path),
+                      "config_fingerprint": self.config_fingerprint()},
+        )
 
     @staticmethod
     def _flatten_config(config: Any, prefix: str = "") -> Dict[str, Any]:
@@ -417,7 +434,13 @@ class Experiment:
                 self.best_checkpoint_path = checkpoint_callback.best_model_path
                 print(f"Testing best checkpoint: {self.best_checkpoint_path}")
 
-            test_results = trainer.test(model=model, datamodule=data_module, ckpt_path=ckpt_path)
+            # A tuning run has no test split on purpose (the protocol forbids looking at it), and
+            # `test_dataloader` would raise. Every config that declares one is tested as before.
+            if "test" in getattr(data_module, "dataset_configs", {"test": None}):
+                test_results = trainer.test(model=model, datamodule=data_module, ckpt_path=ckpt_path)
+            else:
+                print("Sem split de teste configurado: avaliacao de teste pulada.")
+                test_results = []
             test_metrics = test_results[0] if test_results else {}
 
             _print_metric_block("Final train/validation metrics", fit_metrics)

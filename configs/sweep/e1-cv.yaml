@@ -1,0 +1,42 @@
+# E1 / Etapa B -- CV 5-fold por paciente com os hiperparametros CONGELADOS pelo tuning A.1.
+# Protocolo: plano_experimental_artigo_atualizado_2026-10-22.md, secao 2.3.
+#
+#   scripts/submit.sh configs/sweep/e1-cv.yaml
+#
+# Rodada k: treina nos folds != k, escolhe o checkpoint pela validacao fixa e avalia no fold k (o
+# split 'test' do run; eval_set=cv). O teste INCA nao e carregado. Agregacao paciente -> fold e
+# diferencas pareadas: notebooks/artigo/e1_arquiteturas/e1_02_cv.ipynb.
+type: sweep
+name: e1-cv
+family: e1-cv
+plan: src.sweeps.e1.E1CVSweep
+
+# `fold` mais externo: se a grade for cortada, as arquiteturas concluidas seguem pareadas fold a fold.
+axes:
+  seed: [42]
+  fold: [0, 1, 2, 3, 4]
+  arch: [unet, unetplusplus, fpn, deeplabv3plus, swinunet_tiny]
+
+base_configs:
+  unet:          configs/experiment/e1/e1-unet.yaml
+  unetplusplus:  configs/experiment/e1/e1-unetplusplus.yaml
+  fpn:           configs/experiment/e1/e1-fpn.yaml
+  deeplabv3plus: configs/experiment/e1/e1-deeplabv3plus.yaml
+  swinunet_tiny: configs/experiment/e1/e1-swinunet-tiny.yaml
+
+# Gerado por src.tuning.write_frozen_hparams depois do tuning. Sem ele a grade lista, mas nao treina.
+hparams_file: configs/frozen/e1-hparams.yaml
+
+training:
+  max_steps: 8000
+  val_every_n_steps: 500
+  batch_size: 4
+
+data:
+  split_file: configs/splits/inca-protocolo-s42.csv
+
+evaluation:
+  num_classes: 2
+  class_ids: {1: FG}
+
+results_csv: results_per_sample.csv

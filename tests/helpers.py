@@ -92,3 +92,29 @@ def make_batch(n_labeled: int = 2, n_unlabeled: int = 2, size: int = 16, seed: i
         batch["metadata"]["has_hidden_target"] = has_hidden
 
     return batch
+
+
+class ToyPatientFrames(torch.utils.data.Dataset):
+    '''
+    Frames of a few fake patients, with the `metadata` keys the VFSS datasets carry (`paciente_id`,
+    `video_id`, `video_frame`, `is_labeled`) -- enough to drive `Experiment`, `PatientValidation` and
+    `evaluate_per_class` on CPU in a unit test.
+    '''
+
+    def __init__(self, n_patients: int = 3, frames_per_patient: int = 4, size: int = 16, seed: int = 0, **_):
+        generator = torch.Generator().manual_seed(seed)
+        self.images = torch.rand(n_patients * frames_per_patient, 3, size, size, generator=generator) * 2 - 1
+        self.masks = (self.images[:, 0] > 0).long()
+        self.patients = [p for p in range(n_patients) for _ in range(frames_per_patient)]
+
+    def __len__(self) -> int:
+        return len(self.patients)
+
+    def __getitem__(self, index: int):
+        patient = self.patients[index]
+        return {
+            "image": self.images[index],
+            "segmentation": self.masks[index],
+            "metadata": {"paciente_id": patient, "video_id": patient, "video_frame": f"v{patient}_f{index}",
+                         "is_labeled": True, "has_target": True},
+        }

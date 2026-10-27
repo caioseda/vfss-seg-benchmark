@@ -1,0 +1,93 @@
+# E1 -- arquiteturas supervisionadas sob o protocolo do artigo
+# (plano_experimental_artigo_atualizado_2026-10-22.md, secoes 2 e 3).
+#
+# Os cinco configs de configs/experiment/e1/ sao identicos fora do bloco `model`. Rodado sozinho, este
+# YAML executa a rodada 0 do CV com os hiperparametros de referencia. Os sweeps sobrescrevem lr/wd, os
+# folds e o cronograma:
+#   configs/sweep/e1-tuning.yaml  tuning A.1 (treino no fold 0, selecao na validacao fixa, sem teste)
+#   configs/sweep/e1-cv.yaml      Etapa B (CV 5-fold, hiperparametros congelados)
+name: e1-fpn
+type: experiment
+
+model:
+  target: src.models.smp.adapters.SMPModel
+  params:
+    arch: FPN
+    encoder_name: resnet34
+    encoder_weights: imagenet
+    input_normalization: imagenet   # [-1,1] do dataset -> media/desvio do ImageNet, dentro do modelo
+    n_channels: 3
+    n_classes: 2                     # 0=fundo, 1=estrutura (C2..C8 fundidas por binary_all)
+
+lit_module:
+  target: src.models.ssl.supervised.SupervisedLitWrapper
+  params:
+    # Loss 0.5*CE + 0.5*Dice: proporcao 1:1, a mesma que S0/T0/T1 herdam no E2. Com softmax de 2
+    # classes a CE e identica a BCE; o termo Dice faz a media sobre fundo e estrutura.
+    report_class_ids: {1: FG}
+    surface_metric_stages: [test]   # ASSD/HD95 por batch so no teste; a selecao usa PatientValidation
+
+optimizer:
+  target: torch.optim.AdamW
+  params:
+    lr: 1e-3            # referencia; o tuning sorteia, o CV usa o valor congelado
+    weight_decay: 1e-4
+
+lr_scheduler:
+  target: torch.optim.lr_scheduler.CosineAnnealingLR
+  params:
+    T_max: 8000         # = max_steps; o sweep reescreve os dois juntos
+    eta_min: 1e-6
+  interval: step
+
+trainer:
+  params:
+    max_steps: 8000
+    max_epochs: -1
+    accelerator: auto
+    devices: auto
+    # Validacao por PASSOS: o tamanho da epoca muda com o fold. `check_val_every_n_epoch: null` e o que
+    # o Lightning exige para um `val_check_interval` maior que uma epoca.
+    val_check_interval: 500
+    check_val_every_n_epoch: null
+    accumulate_grad_batches: 1
+  checkpoint:
+    monitor: val/dice_patient   # Dice medio por paciente na validacao fixa (protocolo, secao 2.2)
+    mode: max
+    save_top_k: 1
+    filename: 'best-{epoch}-{step}'
+  callbacks:
+    - target: src.callbacks.PrintDeviceCallback
+    - target: src.callbacks.PatientValidation
+      params:
+        num_classes: 2
+        class_ids: {1: FG}
+
+data:
+  target: src.data.base.DataModuleFromConfig
+  params:
+    batch_size: 4      # 4 imagens rotuladas por passo; sem TwoStreamBatchSampler e sem pool
+    num_workers: 8
+    wrap: False
+    shared_dataset_params:
+      dataset_path: /data_ssd/caioseda/data/dataset_inca_all_frames/
+      size: 256
+      window_size: 1
+      stride: 1
+      repeat_channels: True
+      mask_interpolation: nearest
+      target_variant: 'binary_all'
+      # Split congelado do protocolo (scripts/make_protocol_split.py): 80 dev (5 folds) / 11 val / 23
+      # teste INCA, por paciente. O teste INCA nao e alcancavel neste modo.
+      split_mode: protocol
+      split_file: configs/splits/inca-protocolo-s42.csv
+      split_group_column: paciente_id
+      train_folds: null   # null = todos os folds menos cv_fold
+      cv_fold: 0
+      label_fraction: 1.0   # E1: todos os frames anotados dos pacientes de treino
+    train:
+      target: src.data.vfss_frame_dataset.VFSSIncaTrain
+    validation:
+      target: src.data.vfss_frame_dataset.VFSSIncaVal
+    test:
+      target: src.data.vfss_frame_dataset.VFSSIncaTest   # = o fold cv_fold

@@ -147,8 +147,23 @@ tensorboard --logdir_spec 4cls:logs/x1-frames-per-video/runs,8cls:logs/x1-frames
 ```
 
 `scripts/migrate_logs.py` performed the one-off reorganisation (`--dry-run` by default, reversible
-through a manifest). `scripts/index_runs.py` indexes runs into MLflow without copying artefacts --
-the run directory stays the only canonical copy.
+through a manifest).
+
+MLflow tracks every run **live** (`configs/tracking.yaml` turns it on or off in one place;
+`VFSS_TRACKING=off` disables everything). It is an index over the run directory, never a copy: params,
+the scalar series and a `run_dir` tag, no artefacts. A tracker failing never kills a training run, and
+a resumed run continues the same MLflow run. `scripts/index_runs.py` is the one-off backfill for runs
+that predate this (idempotent, `--verify` reconciles, `--replace` repairs a run):
+
+```bash
+python scripts/mlflow_ui.py     # mlflow ui + proxy que comprime e reescreve Origin, para uso por tunel
+```
+
+Use `scripts/mlflow_ui.py` em vez de `mlflow ui` puro quando o acesso for por tunel: o servidor do
+MLflow nao comprime (a pagina de runs baixa ~8.5 MB, 2.1 MB pelo proxy) e responde 403 a POSTs cujo
+`Origin` nao e `localhost`, o que deixa a tabela de runs vazia num tunel publico. O MLflow 3.x tambem
+abre na visao "GenAI", vazia aqui -- os runs estao em "Model training" (o script imprime links ja nessa
+visao). Detalhes em [`docs/mlops-execucao-e-tracking.md`](docs/mlops-execucao-e-tracking.md).
 
 Design decisions behind all of this, including what was measured and what turned out to be broken,
 are in [`docs/mlops-execucao-e-tracking.md`](docs/mlops-execucao-e-tracking.md).

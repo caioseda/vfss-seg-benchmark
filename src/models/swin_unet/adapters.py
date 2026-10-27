@@ -5,6 +5,7 @@ from omegaconf import DictConfig, OmegaConf
 from torch import nn
 
 from .modules import SwinTransformerSys
+from ..modules import InputNormalization
 
 
 class SwinUNet(nn.Module):
@@ -18,7 +19,14 @@ class SwinUNet(nn.Module):
         drop_path_rate: float = 0.1,
         use_checkpoint: bool = False,
         swin: dict | DictConfig | None = None,
+        input_normalization: str | None = None,
     ):
+        '''
+        Args:
+            input_normalization: `imagenet` standardises the dataset's `[-1, 1]` images the way the
+                ImageNet-pretrained Swin encoder expects (see `InputNormalization`). None (the
+                default, and what every config before E1 runs with) feeds them unchanged.
+        '''
         super().__init__()
         if swin is None:
             raise ValueError("`swin` configuration must be provided from YAML for SwinUNet.")
@@ -29,6 +37,7 @@ class SwinUNet(nn.Module):
 
         self.n_channels = n_channels
         self.n_classes = n_classes
+        self.input_normalization = InputNormalization(input_normalization)
 
         self.model = SwinTransformerSys(
             img_size=image_size,
@@ -101,4 +110,4 @@ class SwinUNet(nn.Module):
     def forward(self, x):
         if x.size(1) == 1 and self.n_channels == 3:
             x = x.repeat(1, 3, 1, 1)
-        return self.model(x)
+        return self.model(self.input_normalization(x))

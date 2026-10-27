@@ -25,6 +25,7 @@ from omegaconf import DictConfig, OmegaConf
 from tqdm.auto import tqdm
 
 from src.experiment import Experiment
+from src.tracking import attach_published_metrics
 from src.utils import _resolve_config_path, capture_console_output, get_obj_from_str
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -191,6 +192,12 @@ class Sweep:
                 per_sample["output_dir"] = str(experiment.experiment_run_dir)
                 if not fast_dev_run:
                     self._append_results(per_sample)
+                    # O numero publicado so passa a existir agora, depois do `evaluate()` -- os
+                    # loggers do treino ja fecharam. Anexa-lo ao run do MLflow aqui evita que ele
+                    # fique sem o resultado da celula ate alguem lembrar de rodar o indexador.
+                    attach_published_metrics(experiment.tracking_config,
+                                             experiment.experiment_run_dir,
+                                             experiment.tracking_logs_root)
 
                 self._update_cell(run_id, status="done",
                                   run_dir=str(experiment.experiment_run_dir),

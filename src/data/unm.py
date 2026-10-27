@@ -4,6 +4,9 @@ UNM_TARGET_VARIANTS = (
     "raw",
     "binary_c2_c4",
     "binary_c2_c3_c4",
+    # Derivada de `multiclass_all` por scripts/build_binary_mask_variant.py (labels 1..7), a mesma
+    # construcao da `binary_all` do INCA -- e o que permite avaliar no UNM um modelo treinado nela.
+    "binary_all",
     "multiclass_c2_c4",
     "multiclass_c2_c3_c4",
     "multiclass_all",

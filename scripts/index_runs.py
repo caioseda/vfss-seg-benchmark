@@ -31,10 +31,21 @@ import csv
 from collections import Counter, defaultdict
 from typing import Any, Dict, List, Optional
 
-from src.tracking import MetricPoint, RunRecord, discover_runs, read_metrics, run_uid_for
+from src.tracking import (MetricPoint, RunRecord, discover_runs, interpolate_timestamps,
+                          log_published_metrics, run_time_span,
+                          published_metrics_by_run_dir, read_metrics, resolve_tracking_config,
+                          run_uid_for, tags_for_run)
 
-DEFAULT_MLFLOW_URI = "sqlite:///{logs}/_tracking/mlflow.db"
-DEFAULT_AIM_REPO = "{logs}/_tracking/aim"
+
+
+def mlflow_uri(logs_root: Path) -> str:
+    '''A MESMA URI do treino ao vivo -- uma unica fonte (`src.tracking.resolve_tracking_config`).'''
+    return resolve_tracking_config(logs_root)["mlflow"]["tracking_uri"]
+
+
+def aim_repo(logs_root: Path) -> str:
+    return resolve_tracking_config(logs_root)["aim"]["repo"]
+
 # O MLflow trunca chaves em 250 chars e valores de param em 6000; PL ja trunca params em 250.
 MAX_PARAM_VALUE = 250
 MAX_KEY_LENGTH = 250
@@ -42,60 +53,6 @@ MLFLOW_METRICS_PER_BATCH = 900     # limite real 1000; margem para params/tags n
 
 
 # ---------------------------------------------------------------- metricas publicadas
-
-def published_metrics_by_run_dir(logs_root: Path) -> Dict[str, Dict[str, float]]:
-    '''
-    O numero PUBLICADO de cada celula, lido das CSVs de resultado e agregado por run.
-
-    Sem isto a tabela de runs do tracker mostra a curva de validacao, mas nao responde "qual foi o
-    resultado desta celula da grade" -- que e a pergunta que se faz a ela. As chaves saem com
-    prefixo `published/` para nao se confundirem com o que o treino logou.
-
-    O join e por caminho RELATIVO: as CSVs guardam `output_dir` absoluto, e um prefixo diferente
-    (outro mount, outro clone) faria o join falhar em silencio.
-    '''
-    published: Dict[str, Dict[str, List[float]]] = defaultdict(lambda: defaultdict(list))
-    for csv_path in sorted(logs_root.glob("*/results_*.csv")):
-        with csv_path.open(newline="") as handle:
-            rows = list(csv.DictReader(handle))
-        if not rows or "output_dir" not in rows[0]:
-            continue
-        numeric = [key for key in rows[0]
-                   if key not in {"output_dir", "run_id"} and _looks_numeric(rows, key)]
-        for row in rows:
-            output_dir = row.get("output_dir")
-            if not output_dir:
-                continue
-            try:
-                relative = str(Path(output_dir).resolve().relative_to(logs_root))
-            except ValueError:
-                continue   # fora de logs/: nao ha como associar
-            for key in numeric:
-                raw = row.get(key)
-                if raw in (None, ""):
-                    continue
-                try:
-                    published[relative][key].append(float(raw))
-                except ValueError:
-                    pass
-    return {run: {f"published/{key}": sum(values) / len(values)
-                  for key, values in metrics.items() if values}
-            for run, metrics in published.items()}
-
-
-def _looks_numeric(rows: List[dict], key: str, sample: int = 20) -> bool:
-    seen = 0
-    for row in rows[:sample]:
-        raw = row.get(key)
-        if raw in (None, ""):
-            continue
-        try:
-            float(raw)
-        except ValueError:
-            return False
-        seen += 1
-    return seen > 0
-
 
 # ---------------------------------------------------------------- helpers
 
@@ -109,31 +66,11 @@ def _clean_params(params: Dict[str, Any]) -> Dict[str, str]:
     return cleaned
 
 
-def _tags_for(record: RunRecord) -> Dict[str, str]:
-    metadata = record.metadata
-    tags = {
-        "run_uid": record.run_uid,
-        "run_dir": str(record.run_dir),
-        "run_dir_relative": record.relative_dir,
-        "family": record.family,
-        "run_name": record.run_name,
-        "layout": record.layout,
-        "status": record.status,
-    }
-    for key in ("seed", "host", "config_path", "config_fingerprint", "resumed_from_step"):
-        if metadata.get(key) is not None:
-            tags[key] = str(metadata[key])
-    git = metadata.get("git") or {}
-    if git.get("sha"):
-        tags["git_sha"] = str(git["sha"])
-        tags["git_dirty"] = str(bool(git.get("dirty")))
-    return {k: v[:MAX_PARAM_VALUE] for k, v in tags.items()}
-
-
 # ---------------------------------------------------------------- MLflow
 
 def index_into_mlflow(records: List[RunRecord], tracking_uri: str,
-                      published: Dict[str, Dict[str, float]], verbose: bool = True) -> Counter:
+                      published: Dict[str, Dict[str, float]], verbose: bool = True,
+                      replace: bool = False) -> Counter:
     import mlflow
     from mlflow.entities import Metric
     from mlflow.tracking import MlflowClient
@@ -145,7 +82,10 @@ def index_into_mlflow(records: List[RunRecord], tracking_uri: str,
     for record in records:
         experiment = client.get_experiment_by_name(record.family)
         if experiment is None:
-            experiment_id = client.create_experiment(record.family)
+            # Raiz de artefatos fixa: o store a resolveria contra o CWD de quem cria o experimento.
+            experiment_id = client.create_experiment(
+                record.family,
+                artifact_location=str(record.logs_root / "_tracking" / "mlartifacts"))
         else:
             experiment_id = experiment.experiment_id
 
@@ -154,30 +94,48 @@ def index_into_mlflow(records: List[RunRecord], tracking_uri: str,
         existing = client.search_runs([experiment_id],
                                       filter_string=f"tags.run_uid = '{record.run_uid}'",
                                       max_results=1)
+        if existing and replace:
+            client.delete_run(existing[0].info.run_id)   # soft-delete: a busca padrao o ignora
+            counts["substituido"] += 1
+            existing = []
         if existing:
-            counts["ja indexado"] += 1
+            # Run ja indexado -- inclusive os logados AO VIVO pelo treino. O que ele pode nao ter
+            # e o numero publicado, que so nasce no `evaluate()`, depois de os loggers fecharem.
+            wanted = published.get(record.relative_dir)
+            if wanted and not any(k.startswith("published/") for k in existing[0].data.metrics):
+                log_published_metrics(client, existing[0].info.run_id, wanted)
+                counts["numero publicado anexado"] += 1
+            else:
+                counts["ja indexado"] += 1
             continue
 
         points, _ = read_metrics(record.run_dir)
-        run = client.create_run(experiment_id=experiment_id, tags=_tags_for(record),
-                                run_name=record.run_name)
+        # Quando o treino ACONTECEU, nao quando o indexador rodou: sem isto a interface mostra
+        # "Created: 5 hours ago" e "Duration: 1.7s" para um treino de horas de semanas atras.
+        start_ms, end_ms = run_time_span(record)
+        run = client.create_run(experiment_id=experiment_id, tags=tags_for_run(record),
+                                run_name=record.run_name, start_time=start_ms)
         for key, value in _clean_params(record.params).items():
             try:
                 client.log_param(run.info.run_id, key, value)
             except Exception:
                 pass   # param repetido / invalido nao deve custar o run inteiro
 
+        valid_points = [p for p in points if _valid_metric_key(p.key)]
+        timestamps = interpolate_timestamps(valid_points, start_ms, end_ms)
         metrics = [Metric(key=p.key[:MAX_KEY_LENGTH],
                           value=float("nan") if p.is_nan else p.value,
-                          timestamp=int((p.wall_time or 0) * 1000), step=p.step)
-                   for p in points if _valid_metric_key(p.key)]
+                          timestamp=ts, step=p.step)
+                   for p, ts in zip(valid_points, timestamps)]
         for name, value in published.get(record.relative_dir, {}).items():
-            metrics.append(Metric(key=name[:MAX_KEY_LENGTH], value=value, timestamp=0, step=0))
+            metrics.append(Metric(key=name[:MAX_KEY_LENGTH], value=value,
+                                  timestamp=end_ms or start_ms or 0, step=0))
 
         for start in range(0, len(metrics), MLFLOW_METRICS_PER_BATCH):
             client.log_batch(run.info.run_id, metrics=metrics[start:start + MLFLOW_METRICS_PER_BATCH])
         client.set_terminated(run.info.run_id,
-                              status="FINISHED" if record.status in ("done", "unknown") else "FAILED")
+                              status="FINISHED" if record.status in ("done", "unknown") else "FAILED",
+                              end_time=end_ms)
         counts["indexado"] += 1
         if verbose:
             print(f"  [mlflow] {record.relative_dir}  {len(metrics)} pontos")
@@ -291,7 +249,7 @@ def index_into_aim(records: List[RunRecord], repo: str,
                   system_tracking_interval=None, log_system_params=False)
         try:
             run.name = record.run_name
-            for key, value in _tags_for(record).items():
+            for key, value in tags_for_run(record).items():
                 run[key] = value
             for key, value in _clean_params(record.params).items():
                 run[f"params/{key}"] = value
@@ -333,6 +291,9 @@ def main() -> int:
                         help="mostra o que seria indexado, sem escrever em tracker nenhum")
     parser.add_argument("--verify", action="store_true",
                         help="reconcilia a contagem de pontos entre run dir e trackers")
+    parser.add_argument("--replace", action="store_true",
+                        help="apaga (soft-delete) e reindexa os runs ja existentes do escopo -- para "
+                             "reparar um run cujo tracker falhou durante o treino")
     parser.add_argument("--include-running", action="store_true",
                         help="indexa tambem runs em andamento (serie incompleta)")
     parser.add_argument("--family", default=None, help="indexa so uma familia")
@@ -376,16 +337,16 @@ def main() -> int:
         print("\n--dry-run: nada foi escrito.")
         return 0
 
-    mlflow_uri = DEFAULT_MLFLOW_URI.format(logs=logs_root)
-    aim_repo = DEFAULT_AIM_REPO.format(logs=logs_root)
+    mlflow_target = mlflow_uri(logs_root)
+    aim_target = aim_repo(logs_root)
     (logs_root / "_tracking").mkdir(parents=True, exist_ok=True)
 
     if args.backend in ("mlflow", "both"):
-        print(f"\nMLflow -> {mlflow_uri}")
-        print(dict(index_into_mlflow(records, mlflow_uri, published)))
+        print(f"\nMLflow -> {mlflow_target}")
+        print(dict(index_into_mlflow(records, mlflow_target, published, replace=args.replace)))
     if args.backend in ("aim", "both"):
-        print(f"\nAim -> {aim_repo}")
-        print(dict(index_into_aim(records, aim_repo, published)))
+        print(f"\nAim -> {aim_target}")
+        print(dict(index_into_aim(records, aim_target, published)))
     return 0
 
 
@@ -398,7 +359,7 @@ def _verify(records: List[RunRecord], logs_root: Path, args) -> int:
     if args.backend in ("mlflow", "both"):
         try:
             from mlflow.tracking import MlflowClient
-            client = MlflowClient(tracking_uri=DEFAULT_MLFLOW_URI.format(logs=logs_root))
+            client = MlflowClient(tracking_uri=mlflow_uri(logs_root))
             indexed = set()
             for experiment in client.search_experiments():
                 for run in client.search_runs([experiment.experiment_id], max_results=50000):
@@ -414,7 +375,7 @@ def _verify(records: List[RunRecord], logs_root: Path, args) -> int:
 
     if args.backend in ("aim", "both"):
         try:
-            indexed = existing_aim_run_uids(DEFAULT_AIM_REPO.format(logs=logs_root))
+            indexed = existing_aim_run_uids(aim_repo(logs_root))
             missing = set(on_disk) - indexed
             print(f"Aim: {len(indexed)} runs indexados, {len(missing)} ausentes")
             problems += len(missing)

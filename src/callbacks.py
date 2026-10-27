@@ -160,6 +160,72 @@ class VolumetricValidation(Callback):
                            sync_dist=True)
 
 
+class PatientValidation(Callback):
+    '''
+    Validate per patient and log `<prefix>/<metric>_patient`, the article protocol's selection metric.
+
+    Same mechanism as `VolumetricValidation`, for the same reason: `LitWrapper.validation_step`
+    averages frames batch by batch, which lets the few patients with many frames dominate, while the
+    protocol selects checkpoints on the mean over *patients* of their mean frame Dice. A callback adds
+    that without touching the module, and `ModelCheckpoint` (appended by `Experiment` after the
+    config-declared callbacks) reads it in `on_validation_end`, so `monitor: val/dice_patient` works.
+
+    It runs a second pass over the validation loader -- ~110 frames, a few seconds every validation.
+    The module's frame-level `val/*` keeps being logged alongside, as a diagnostic.
+
+    Args:
+        num_classes: including background.
+        class_ids: `{class_index: display_name}`; defaults to the module's `report_class_ids`.
+        prefix: metric namespace, `val` by default.
+        forward_attr: attribute to prefer for the forward pass, so Mean Teacher is evaluated with
+            its teacher exactly as `evaluate_per_class` does.
+    '''
+
+    def __init__(self, num_classes: int, class_ids=None, prefix: str = "val",
+                 forward_attr: str = "_eval_forward"):
+        super().__init__()
+        self.num_classes = num_classes
+        self.class_ids = class_ids
+        self.prefix = prefix
+        self.forward_attr = forward_attr
+
+    def _resolve_class_ids(self, pl_module):
+        if self.class_ids is not None:
+            if isinstance(self.class_ids, DictConfig):
+                self.class_ids = OmegaConf.to_container(self.class_ids, resolve=True)
+            return {int(k): str(v) for k, v in dict(self.class_ids).items()}
+        return pl_module.report_class_ids
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        if trainer.sanity_checking:
+            return
+        from src.evaluation import METRIC_NAMES, aggregate_per_patient, evaluate_per_class
+
+        was_training = pl_module.training
+        per_sample = evaluate_per_class(
+            pl_module, trainer.datamodule.val_dataloader(),
+            num_classes=self.num_classes, class_ids=self._resolve_class_ids(pl_module),
+            device=trainer.strategy.root_device,
+            forward_fn=getattr(pl_module, self.forward_attr, None),
+        )
+        if was_training:
+            pl_module.train()
+
+        aggregated = aggregate_per_patient(per_sample)
+        logs = {}
+        for _, row in aggregated.iterrows():
+            for metric in METRIC_NAMES:
+                if row[metric] == row[metric]:  # skip NaN
+                    logs[f"{self.prefix}/{metric}_patient/{row['class']}"] = float(row[metric])
+        for metric in METRIC_NAMES:
+            value = aggregated[metric].mean(skipna=True)
+            if value == value:
+                logs[f"{self.prefix}/{metric}_patient"] = float(value)
+
+        pl_module.log_dict(logs, prog_bar=False, logger=True, on_step=False, on_epoch=True,
+                           sync_dist=True)
+
+
 class ResumeFidelity(Callback):
     '''
     Carries the RNG state through a checkpoint, so a resumed run continues the *same* trajectory

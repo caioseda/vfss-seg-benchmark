@@ -32,6 +32,10 @@ import csv
 import hashlib
 import json
 import math
+import os
+import re
+from datetime import datetime
+from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -276,56 +280,355 @@ def read_metrics(run_dir: Path) -> Tuple[List[MetricPoint], str]:
     return _read_event_files(run_dir), "events"
 
 
+# ---------------------------------------------------------------- quando o run aconteceu
+
+# Os diretorios de run antigos sao nomeados pelo instante em que o treino comecou
+# (`2026-09-14-17-46-29`), inclusive os de benchmark (`006-2026-03-02-18-53-26/01-vfss-unet`).
+_DIR_TIMESTAMP = re.compile(r"(\d{4})-(\d{2})-(\d{2})-(\d{2})-(\d{2})-(\d{2})")
+_END_MARKERS = ("csv/metrics.csv", "metrics.csv", "console.log")
+
+
+def run_time_span(record: RunRecord) -> Tuple[Optional[int], Optional[int]]:
+    '''
+    (inicio, fim) do treino, em milissegundos epoch -- ou None quando nao ha como saber.
+
+    Existe porque o backfill cria o run no MLflow NO MOMENTO em que indexa e o encerra em seguida;
+    sem isto a interface mostra "Created: 5 hours ago" e "Duration: 1.7s" para um treino que durou
+    horas e aconteceu semanas antes, e o eixo de tempo dos graficos cai em 1970.
+
+    Fontes, da mais para a menos confiavel:
+      inicio  `run.json:started_at` -> timestamp no nome do diretorio -> None
+      fim     `run.json:finished_at` -> mtime do ultimo arquivo de metrica/log -> None
+    '''
+    metadata = record.metadata
+
+    def from_iso(value: Any) -> Optional[int]:
+        try:
+            return int(datetime.fromisoformat(str(value)).timestamp() * 1000)
+        except Exception:
+            return None
+
+    start = from_iso(metadata.get("started_at")) if metadata.get("started_at") else None
+    if start is None:
+        # O ULTIMO componente do caminho que parece um timestamp: num run de benchmark o relevante
+        # esta no pai (`NNN-<ts>`), e num run normal e o proprio diretorio.
+        for part in reversed(record.run_dir.relative_to(record.logs_root).parts):
+            match = _DIR_TIMESTAMP.search(part)
+            if match:
+                try:
+                    start = int(datetime(*(int(g) for g in match.groups())).timestamp() * 1000)
+                except ValueError:
+                    start = None
+                break
+
+    end = from_iso(metadata.get("finished_at")) if metadata.get("finished_at") else None
+    if end is None:
+        mtimes = [(record.run_dir / name).stat().st_mtime for name in _END_MARKERS
+                  if (record.run_dir / name).is_file()]
+        mtimes += [event.stat().st_mtime for event in record.run_dir.rglob("events.out.tfevents.*")]
+        if mtimes:
+            end = int(max(mtimes) * 1000)
+
+    if start is not None and end is not None and end < start:
+        end = start      # relogio torto / arquivo copiado: duracao zero e melhor que negativa
+    return start, end
+
+
+def interpolate_timestamps(points: List[MetricPoint], start: Optional[int],
+                           end: Optional[int]) -> List[int]:
+    '''
+    Timestamp (ms) de cada ponto, distribuindo os passos linearmente entre inicio e fim.
+
+    O `metrics.csv` nao guarda quando cada linha foi escrita, so o passo. Sem timestamp o MLflow
+    grava 0 e o grafico com eixo de tempo ("Time (Wall)") coloca tudo em 1970. A interpolacao e uma
+    aproximacao -- os passos nao tem custo uniforme (validacao e teste pesam mais) --, entao serve
+    para ordenar e dar a escala certa, nao para medir a duracao de um passo. Pontos que ja trazem
+    `wall_time` (vindos de event files) mantem o valor real.
+    '''
+    if start is None:
+        return [int((p.wall_time or 0) * 1000) for p in points]
+    end = end if end is not None else start
+    max_step = max((p.step for p in points), default=0) or 1
+    return [int(p.wall_time * 1000) if p.wall_time
+            else int(start + (end - start) * (p.step / max_step)) for p in points]
+
+
+# ---------------------------------------------------------------- tags e numero publicado
+#
+# Vivem aqui, e nao em `scripts/index_runs.py`, porque o treino ao vivo e o backfill TEM de produzir
+# a mesma identidade e as mesmas tags: um run logado ao vivo cujo `run_uid` diferisse do que o
+# indexador calcula seria reindexado como se fosse outro, e apareceria duplicado.
+
+MAX_PARAM_VALUE = 250
+
+
+def tags_for_run(record: RunRecord) -> Dict[str, str]:
+    metadata = record.metadata
+    tags = {
+        "run_uid": record.run_uid,
+        "run_dir": str(record.run_dir),
+        "run_dir_relative": record.relative_dir,
+        "family": record.family,
+        "run_name": record.run_name,
+        "layout": record.layout,
+        "status": record.status,
+    }
+    for key in ("seed", "host", "config_path", "config_fingerprint", "resumed_from_step"):
+        if metadata.get(key) is not None:
+            tags[key] = str(metadata[key])
+    git = metadata.get("git") or {}
+    if git.get("sha"):
+        tags["git_sha"] = str(git["sha"])
+        tags["git_dirty"] = str(bool(git.get("dirty")))
+    return {k: v[:MAX_PARAM_VALUE] for k, v in tags.items()}
+
+
+def _looks_numeric(rows: List[dict], key: str, sample: int = 20) -> bool:
+    seen = 0
+    for row in rows[:sample]:
+        raw = row.get(key)
+        if raw in (None, ""):
+            continue
+        try:
+            float(raw)
+        except ValueError:
+            return False
+        seen += 1
+    return seen > 0
+
+
+def published_metrics_by_run_dir(logs_root: Path) -> Dict[str, Dict[str, float]]:
+    '''
+    O numero PUBLICADO de cada celula, lido das CSVs de resultado e agregado por run.
+
+    Sem isto a tabela de runs do tracker mostra a curva de validacao, mas nao responde "qual foi o
+    resultado desta celula da grade". As chaves saem com prefixo `published/` para nao se confundirem
+    com o que o treino logou. O join e por caminho RELATIVO: as CSVs guardam `output_dir` absoluto, e
+    um prefixo diferente (outro mount, outro clone) faria o join falhar em silencio.
+    '''
+    logs_root = Path(logs_root).resolve()
+    published: Dict[str, Dict[str, List[float]]] = defaultdict(lambda: defaultdict(list))
+    for csv_path in sorted(logs_root.glob("*/results_*.csv")):
+        with csv_path.open(newline="") as handle:
+            rows = list(csv.DictReader(handle))
+        if not rows or "output_dir" not in rows[0]:
+            continue
+        numeric = [key for key in rows[0]
+                   if key not in {"output_dir", "run_id"} and _looks_numeric(rows, key)]
+        for row in rows:
+            output_dir = row.get("output_dir")
+            if not output_dir:
+                continue
+            try:
+                relative = str(Path(output_dir).resolve().relative_to(logs_root))
+            except ValueError:
+                continue   # fora de logs/: nao ha como associar
+            for key in numeric:
+                raw = row.get(key)
+                if raw in (None, ""):
+                    continue
+                try:
+                    published[relative][key].append(float(raw))
+                except ValueError:
+                    pass
+    return {run: {f"published/{key}": sum(values) / len(values)
+                  for key, values in metrics.items() if values}
+            for run, metrics in published.items()}
+
+
+# ---------------------------------------------------------------- configuracao dos trackers
+
+# Os trackers ficam LIGADOS por padrao para o MLflow e DESLIGADOS para o Aim. O Aim 3.29.1 nao
+# persiste params nem metricas (ver `scripts/index_runs.py:assert_aim_persists`), entao liga-lo por
+# padrao produziria runs vazios em silencio.
+DEFAULT_TRACKING: Dict[str, Any] = {
+    "mlflow": {"enabled": True, "tracking_uri": "sqlite:///{logs}/_tracking/mlflow.db"},
+    "aim": {"enabled": False, "repo": "{logs}/_tracking/aim"},
+}
+TRACKING_CONFIG_PATH = Path(__file__).resolve().parents[1] / "configs" / "tracking.yaml"
+
+
+def infer_logs_root(run_dir: Path, fallback: Optional[Path] = None) -> Path:
+    '''O ancestral chamado `logs`; senao o fallback; senao dois niveis acima do run.'''
+    run_dir = Path(run_dir).resolve()
+    for ancestor in run_dir.parents:
+        if ancestor.name == "logs":
+            return ancestor
+    return Path(fallback).resolve() if fallback else run_dir.parent.parent
+
+
+def resolve_tracking_config(logs_root: Path, experiment_logging: Optional[Any] = None) -> Dict[str, Any]:
+    '''
+    Configuracao efetiva dos trackers. Precedencia, da menor para a maior:
+
+        DEFAULT_TRACKING  <  configs/tracking.yaml  <  bloco `logging:` do YAML do experimento
+
+    de modo que ligar ou desligar o MLflow e uma decisao de UM arquivo, e nao de 40 YAMLs de
+    experimento. `VFSS_TRACKING=off` desliga tudo -- para testes e para o caso de o tracker estar
+    atrapalhando, sem editar nada.
+    '''
+    from omegaconf import OmegaConf
+
+    layers = [OmegaConf.create(DEFAULT_TRACKING)]
+    if TRACKING_CONFIG_PATH.is_file():
+        layers.append(OmegaConf.load(str(TRACKING_CONFIG_PATH)))
+    if experiment_logging:
+        container = (OmegaConf.to_container(experiment_logging, resolve=True)
+                     if OmegaConf.is_config(experiment_logging) else dict(experiment_logging))
+        layers.append(OmegaConf.create(container))
+    config = OmegaConf.to_container(OmegaConf.merge(*layers), resolve=True)
+
+    if os.environ.get("VFSS_TRACKING", "").lower() in {"off", "0", "false", "no"}:
+        for backend in ("mlflow", "aim"):
+            config.setdefault(backend, {})["enabled"] = False
+
+    for backend, key in (("mlflow", "tracking_uri"), ("aim", "repo")):
+        if isinstance(config.get(backend, {}).get(key), str):
+            config[backend][key] = config[backend][key].format(logs=str(Path(logs_root).resolve()))
+    return config
+
+
 # ---------------------------------------------------------------- loggers ao vivo
 
-def build_loggers(run_dir: Path, family: Optional[str], run_name: str, run_uid: str,
-                  logging_cfg: Optional[Any] = None) -> List[Any]:
+def _safe_mlflow_logger_cls():
     '''
-    Loggers de um run ao vivo: TensorBoard + CSV sempre, MLflow e Aim quando habilitados.
+    `MLFlowLogger` que NUNCA derruba o treino.
+
+    O tracker e um indice; a fonte da verdade e o `csv/metrics.csv`. Uma excecao do backend -- banco
+    travado por outro processo, disco cheio, um valor que o MLflow recusa -- levantada dentro de
+    `log_metrics` interromperia um treino de horas por causa de algo que nao e o experimento. Cada
+    falha e contada e avisada (as tres primeiras), e o run segue.
+
+    Definida sob demanda para nao pagar o import do MLflow a quem nao o usa.
+    '''
+    from pytorch_lightning.loggers import MLFlowLogger
+
+    class SafeMLFlowLogger(MLFlowLogger):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            # Por INSTANCIA, nao por classe: um sweep roda muitas celulas no mesmo processo, e um
+            # contador de classe silenciaria os avisos de toda celula depois das tres primeiras
+            # falhas somadas -- justamente quando mais importa saber que um run ficou incompleto.
+            self.failures = 0
+
+        def _guard(self, name, call, *args, **kwargs):
+            try:
+                return call(*args, **kwargs)
+            except Exception as error:
+                self.failures += 1
+                if self.failures <= 3:
+                    print(f"[tracking] MLflow.{name} falhou ({type(error).__name__}: "
+                          f"{str(error)[:120]}). O run continua; a fonte da verdade e "
+                          f"csv/metrics.csv -- repare depois com "
+                          f"`scripts/index_runs.py --replace --family <familia>`.")
+                return None
+
+        def log_hyperparams(self, params):
+            return self._guard("log_hyperparams", super().log_hyperparams, params)
+
+        def log_metrics(self, metrics, step=None):
+            return self._guard("log_metrics", super().log_metrics, metrics, step)
+
+        def finalize(self, status="success"):
+            return self._guard("finalize", super().finalize, status)
+
+    return SafeMLFlowLogger
+
+
+def build_loggers(run_dir: Path, logs_root: Path, run_name: str,
+                  logging_cfg: Optional[Dict[str, Any]] = None,
+                  metadata: Optional[Dict[str, Any]] = None) -> List[Any]:
+    '''
+    Loggers de um run ao vivo: TensorBoard + CSV sempre, MLflow e Aim conforme a configuracao.
 
     Nenhum dos dois recebe artefatos -- so params, escalares e o caminho do run dir. Ver o contrato
-    no topo deste arquivo.
+    no topo deste arquivo. A identidade (`run_uid`) e as tags saem de `tags_for_run`, as MESMAS que o
+    indexador usa, entao um run logado ao vivo e reconhecido pelo backfill em vez de duplicado.
+
+    Uma falha ao CONSTRUIR um tracker (nao instalado, URI invalida) e avisada e ignorada: o treino
+    nao depende dele.
     '''
     from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
 
     from src.utils import instantiate_from_config
 
+    run_dir = Path(run_dir).resolve()
+    logs_root = Path(logs_root).resolve()
     save_dir = str(run_dir)
     loggers: List[Any] = [
         TensorBoardLogger(save_dir=save_dir, name="", version="tensorboard"),
         CSVLogger(save_dir=save_dir, name="", version="csv"),
     ]
 
-    config = logging_cfg or {}
-    tags = {"run_dir": str(run_dir), "run_uid": run_uid, "family": family or "", "run_name": run_name}
+    config = logging_cfg if logging_cfg is not None else resolve_tracking_config(logs_root)
+    record = RunRecord(
+        run_dir=run_dir, logs_root=logs_root, run_uid=run_uid_for(run_dir, logs_root),
+        layout="csv/metrics.csv + tensorboard/",
+        metadata={"run_name": run_name, "status": "running", **(metadata or {})},
+    )
+    tags = tags_for_run(record)
 
-    if config.get("mlflow", {}).get("enabled"):
-        loggers.append(_build_mlflow_logger(config["mlflow"], run_name, tags))
-    if config.get("aim", {}).get("enabled"):
-        loggers.append(_build_aim_logger(config["aim"], run_name, tags))
+    for backend, builder in (("mlflow", _build_mlflow_logger), ("aim", _build_aim_logger)):
+        if not (config.get(backend) or {}).get("enabled"):
+            continue
+        try:
+            loggers.append(builder(config[backend], record, tags, logs_root))
+        except Exception as error:
+            print(f"[tracking] {backend} desabilitado neste run ({type(error).__name__}: "
+                  f"{str(error)[:160]}). O treino segue sem ele.")
 
     for logger_cfg in (config.get("loggers") or []):
         loggers.append(instantiate_from_config(logger_cfg))
     return loggers
 
 
-def _build_mlflow_logger(config: Any, run_name: str, tags: Dict[str, str]):
-    from pytorch_lightning.loggers import MLFlowLogger
-    return MLFlowLogger(
-        experiment_name=str(config.get("experiment_name") or tags["family"] or "default"),
-        run_name=run_name,
-        tracking_uri=str(config["tracking_uri"]),
+def find_mlflow_run_id(tracking_uri: str, experiment_name: str, run_uid: str) -> Optional[str]:
+    '''Run ja existente para este `run_uid` -- o que faz uma RETOMADA continuar o mesmo run.'''
+    from mlflow.tracking import MlflowClient
+
+    client = MlflowClient(tracking_uri=tracking_uri)
+    experiment = client.get_experiment_by_name(experiment_name)
+    if experiment is None:
+        return None
+    found = client.search_runs([experiment.experiment_id],
+                               filter_string=f"tags.run_uid = '{run_uid}'", max_results=1)
+    return found[0].info.run_id if found else None
+
+
+def _build_mlflow_logger(config: Dict[str, Any], record: RunRecord, tags: Dict[str, str],
+                         logs_root: Path):
+    tracking_uri = str(config["tracking_uri"])
+    experiment_name = str(config.get("experiment_name") or record.family or "default")
+
+    # Uma retomada tem o MESMO diretorio e portanto o mesmo run_uid. Sem reaproveitar o run do
+    # MLflow, cada tentativa criaria um segundo run para o que e um unico treino.
+    existing = find_mlflow_run_id(tracking_uri, experiment_name, record.run_uid)
+    if existing:
+        print(f"[tracking] MLflow: continuando o run existente {existing[:8]} (retomada)")
+
+    return _safe_mlflow_logger_cls()(
+        experiment_name=experiment_name,
+        run_name=record.run_name,
+        tracking_uri=tracking_uri,
         tags=tags,
+        run_id=existing,
+        # O store resolve o artifact root contra o CWD de quem CRIA o experimento e grava o caminho
+        # absoluto -- sem fixar, o mesmo experimento teria raizes diferentes conforme de onde o
+        # treino foi lancado. So vale para experimentos novos (o parametro e de `create_experiment`).
+        artifact_location=str(Path(logs_root) / "_tracking" / "mlartifacts"),
         # Sem artefatos: os checkpoints ficam no run dir, e a tag `run_dir` aponta para eles.
         log_model=False,
     )
 
 
-def _build_aim_logger(config: Any, run_name: str, tags: Dict[str, str]):
+def _build_aim_logger(config: Dict[str, Any], record: RunRecord, tags: Dict[str, str],
+                      logs_root: Path):
+    print("[tracking] AVISO: o Aim 3.29.1 nao persiste params nem metricas (ver "
+          "scripts/index_runs.py:assert_aim_persists); este run provavelmente ficara vazio la.")
     from aim.pytorch_lightning import AimLogger
     logger = AimLogger(
         repo=str(config["repo"]),
-        experiment=str(config.get("experiment") or tags["family"] or "default"),
+        experiment=str(config.get("experiment") or record.family or "default"),
         # O default e 10 s, e injetaria ~10 mil pontos de `__system__` num run de 2 h -- mais que as
         # metricas reais do run, e ausentes nos runs retro-indexados, o que tornaria os dois
         # conjuntos incomparaveis.
@@ -335,3 +638,51 @@ def _build_aim_logger(config: Any, run_name: str, tags: Dict[str, str]):
     for key, value in tags.items():
         logger.experiment.set(key, value, strict=False)
     return logger
+
+
+# ---------------------------------------------------------------- numero publicado ao vivo
+
+def log_published_metrics(client, run_id: str, metrics: Dict[str, float]) -> int:
+    '''Grava as metricas `published/*` num run do MLflow. Devolve quantas.'''
+    from mlflow.entities import Metric
+
+    entries = [Metric(key=name[:250], value=value, timestamp=0, step=0)
+               for name, value in metrics.items()]
+    for start in range(0, len(entries), 900):
+        client.log_batch(run_id, metrics=entries[start:start + 900])
+    return len(entries)
+
+
+def attach_published_metrics(tracking_config: Dict[str, Any], run_dir: Path, logs_root: Path) -> int:
+    '''
+    Anexa ao run do MLflow o numero publicado da celula, DEPOIS de ele estar na CSV de resultado.
+
+    Existe porque o numero publicado so nasce no `evaluate()`, depois de o treino ter terminado e de
+    os loggers terem fechado -- um run logado ao vivo nunca o receberia, e o indexador, ao ver o run
+    ja indexado, o pularia. Devolve quantas metricas anexou (0 se o MLflow esta desligado ou o run
+    nao esta na CSV). Nunca levanta: e um acabamento, nao parte do treino.
+    '''
+    try:
+        if not (tracking_config.get("mlflow") or {}).get("enabled"):
+            return 0
+        from mlflow.tracking import MlflowClient
+
+        record_dir = Path(run_dir).resolve()
+        logs_root = Path(logs_root).resolve()
+        relative = str(record_dir.relative_to(logs_root))
+        published = published_metrics_by_run_dir(logs_root).get(relative)
+        if not published:
+            return 0
+        tracking_uri = str(tracking_config["mlflow"]["tracking_uri"])
+        experiment_name = relative.split(os.sep)[0]
+        run_id = find_mlflow_run_id(tracking_uri, experiment_name, run_uid_for(record_dir, logs_root))
+        if not run_id:
+            return 0
+        client = MlflowClient(tracking_uri=tracking_uri)
+        if any(key.startswith("published/") for key in client.get_run(run_id).data.metrics):
+            return 0   # ja anexado
+        return log_published_metrics(client, run_id, published)
+    except Exception as error:
+        print(f"[tracking] nao foi possivel anexar o numero publicado ({type(error).__name__}: "
+              f"{str(error)[:120]}); `scripts/index_runs.py` o completa depois.")
+        return 0

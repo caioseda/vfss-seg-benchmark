@@ -12,11 +12,14 @@ from torchvision import transforms
 
 from typing import Sequence, Union, Optional
 
+from .splits import assign_protocol_split, load_protocol_split, resolve_project_path
+
 logger = logging.getLogger(__name__)
 
 TARGET_TYPES = ("mask", "points")
 TARGET_VARIANTS = ("raw", "binary_c2_c4", "binary_all", "multiclass_c2_c4", "multiclass_all")
 SPLIT_NAMES = ("train", "val", "test")
+SPLIT_MODES = ("legado", "seed", "protocol")
 DEFAULT_SPLIT_RATIOS = (0.7, 0.10, 0.2)
 
 
@@ -363,6 +366,9 @@ class VFSSFrameDatasetBase(Dataset):
                  split_seed: int = 42,
                  split_ratios: Sequence[float] = DEFAULT_SPLIT_RATIOS,
                  split_group_column: str = "paciente_id",
+                 split_file: Optional[Union[str, Path]] = None,
+                 train_folds: Optional[Sequence[int]] = None,
+                 cv_fold: Optional[int] = None,
                  label_fraction: float = 1.0,
                  label_frames_per_group: Optional[int] = None,
                  label_seed: int = 42,
@@ -388,10 +394,18 @@ class VFSSFrameDatasetBase(Dataset):
             split (str, optional): O split do dataset a ser carregado ('train', 'val' ou 'test'). Se None, carrega todo o dataset.
             split_mode (str): 'legado' usa a coluna `split_legado` do CSV (divisão histórica, apenas retrocompatibilidade).
                 'seed' ignora `split_legado` e divide o dataset em tempo de execução por `split_group_column`, usando `split_seed`/`split_ratios`.
+                'protocol' lê a partição fixa do artigo de `split_file` (ver `src/data/splits.py`) e monta o split deste
+                run a partir de `train_folds`/`cv_fold`; pacientes fora dele (incluindo todo o teste INCA) ficam sem split.
             split_seed (int): Seed usada para gerar a divisão quando `split_mode='seed'`.
             split_ratios (Sequence[float]): Proporções (train, val, test) usadas quando `split_mode='seed'`. Devem somar 1.0.
             split_group_column (str): Coluna usada para agrupar frames que não podem ficar em splits diferentes
                 (por padrão `paciente_id`; datasets sem esse identificador podem usar `video_id`).
+            split_file (str | Path, optional): Tabela por paciente gerada por `scripts/make_protocol_split.py`.
+                Obrigatória com `split_mode='protocol'`; um caminho relativo é resolvido contra a raiz do repo.
+            train_folds (Sequence[int], optional): Folds do desenvolvimento usados como 'train' em `split_mode='protocol'`.
+                None usa todos os folds exceto `cv_fold` (o tuning A.1 passa `[0]`).
+            cv_fold (int, optional): Fold do desenvolvimento retido para avaliação; vira o split 'test'. None deixa
+                o split 'test' vazio -- o teste INCA nunca é exposto por este modo.
             label_fraction (float): Fração (por `label_group_column`) dos frames de `label_regime_splits` que mantêm
                 o rótulo revelado; o restante é marcado `is_labeled=False` mas continua no dataset (não é descartado).
                 Regimes são aninhados para um `label_seed` fixo: ver `apply_label_regime`. Ignorado quando
@@ -443,14 +457,34 @@ class VFSSFrameDatasetBase(Dataset):
         self.video_frame_df = with_target_type(self.video_frame_df, target_type)
         self.video_frame_df = with_target_variant(self.video_frame_df, target_variant)
 
-        if split_mode not in ("legado", "seed"):
-            raise ValueError(f"split_mode must be 'legado' or 'seed', got '{split_mode}'")
+        if split_mode not in SPLIT_MODES:
+            raise ValueError(f"split_mode must be one of {SPLIT_MODES}, got '{split_mode}'")
         self.split_mode = split_mode
         self.split = split
         self.split_group_column = split_group_column
 
         if split_mode == "legado":
             self.video_frame_df['split'] = self.video_frame_df['split_legado']
+        elif split_mode == "protocol":
+            if split_file is None:
+                raise ValueError("split_mode='protocol' requires `split_file`.")
+            if split == "test" and cv_fold is None:
+                # Without a held-out fold this split would be empty -- and the only other patients
+                # it could ever hold are the INCA test set, which no tuning or CV run may load.
+                raise ValueError(
+                    "split='test' with split_mode='protocol' requires `cv_fold`: the INCA test set "
+                    "is not reachable from this mode. Drop the `test` dataset for tuning runs."
+                )
+            self.split_file = resolve_project_path(split_file)
+            self.train_folds = None if train_folds is None else [int(f) for f in train_folds]
+            self.cv_fold = None if cv_fold is None else int(cv_fold)
+            self.video_frame_df = assign_protocol_split(
+                self.video_frame_df, load_protocol_split(self.split_file),
+                train_folds=self.train_folds, cv_fold=self.cv_fold, group_column=split_group_column,
+            )
+            logger.info(
+                f"Protocol split from {self.split_file} (train_folds={self.train_folds}, cv_fold={self.cv_fold})."
+            )
         else:
             self.split_seed = split_seed
             self.split_ratios = tuple(split_ratios)
