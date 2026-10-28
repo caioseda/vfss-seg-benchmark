@@ -242,5 +242,78 @@ class ExperimentWithoutTestTests(unittest.TestCase):
         self.assertIn("test/dice_score", outcome["test_metrics"])
 
 
+class ExplodingNet(torch.nn.Module):
+    '''Falha no primeiro forward: o stand-in de um erro de treino (o BatchNorm com 1 valor por canal).'''
+
+    def __init__(self, n_channels: int = 3, n_classes: int = 2, **_):
+        super().__init__()
+        self.n_channels, self.n_classes = n_channels, n_classes
+        self.weight = torch.nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        raise ValueError("Expected more than 1 value per channel when training")
+
+
+class DropLastTrainTests(unittest.TestCase):
+    '''
+    Um ultimo lote de 1 frame quebra qualquer BatchNorm com 1 valor por canal (o ramo de pooling do
+    ASPP do DeepLabV3+). `drop_last_train` o descarta, so no loader de treino.
+    '''
+
+    def _loaders(self, **kwargs):
+        from src.data.base import DataModuleFromConfig
+        dataset = {"target": "tests.helpers.ToyPatientFrames", "params": {"n_patients": 3, "frames_per_patient": 4}}
+        # 12 frames em lotes de 11: 11 + 1.
+        module = DataModuleFromConfig(batch_size=11, num_workers=0, train=dataset, validation=dataset, **kwargs)
+        module.setup("fit")
+        return module.train_dataloader(), module.val_dataloader()
+
+    def test_default_keeps_the_trailing_batch(self):
+        train, _ = self._loaders()
+        self.assertEqual([len(batch["image"]) for batch in train], [11, 1])
+
+    def test_drop_last_train_drops_the_trailing_batch_of_the_train_loader_only(self):
+        train, validation = self._loaders(drop_last_train=True)
+        self.assertEqual([len(batch["image"]) for batch in train], [11])
+        # A validacao tem de ver todos os frames: descartar um mudaria o numero publicado.
+        self.assertEqual([len(batch["image"]) for batch in validation], [11, 1])
+
+    def test_e1_configs_enable_it(self):
+        for path in sorted((PROJECT_ROOT / "configs" / "experiment" / "e1").glob("*.yaml")):
+            with self.subTest(config=path.name):
+                self.assertTrue(OmegaConf.load(path).data.params.drop_last_train)
+
+
+class FailedRunRecordsItsTracebackTests(unittest.TestCase):
+    '''O erro de treino tem de ficar no `console.log` e no `run.json`, nao so no terminal.'''
+
+    def test_traceback_is_in_console_log_and_run_json(self):
+        import json
+        from src.experiment import Experiment
+        config = ExperimentWithoutTestTests()._config(with_test=False)
+        config["model"]["target"] = "tests.test_e1_protocol.ExplodingNet"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "toy.yaml"
+            path.write_text(yaml.safe_dump(config))
+            previous = os.environ.get("VFSS_TRACKING")
+            os.environ["VFSS_TRACKING"] = "off"
+            try:
+                experiment = Experiment(config_path=path, log_dir=Path(tmp) / "logs", family="toy", run_uid="r0")
+                with self.assertRaises(ValueError):
+                    experiment.run(seed=0)
+                run_dir = experiment.experiment_run_dir
+                console = (run_dir / "console.log").read_text()
+                metadata = json.loads((run_dir / "run.json").read_text())
+            finally:
+                if previous is None:
+                    os.environ.pop("VFSS_TRACKING", None)
+                else:
+                    os.environ["VFSS_TRACKING"] = previous
+        self.assertIn("Traceback (most recent call last)", console)
+        self.assertIn("ValueError: Expected more than 1 value per channel", console)
+        self.assertEqual(metadata["status"], "failed")
+        self.assertIn("Traceback (most recent call last)", metadata["traceback"])
+
+
 if __name__ == "__main__":
     unittest.main()

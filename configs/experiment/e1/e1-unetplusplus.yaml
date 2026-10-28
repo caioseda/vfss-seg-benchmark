@@ -67,6 +67,7 @@ data:
   target: src.data.base.DataModuleFromConfig
   params:
     batch_size: 4      # 4 imagens rotuladas por passo; sem TwoStreamBatchSampler e sem pool
+    drop_last_train: True   # lote final de 1 frame quebra BatchNorm (ASPP do DeepLabV3+)
     num_workers: 8
     wrap: False
     shared_dataset_params:

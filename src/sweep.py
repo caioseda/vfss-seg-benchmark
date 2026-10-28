@@ -16,6 +16,7 @@ comum depois de uma conexao cair.
     python scripts/run_sweep.py --config configs/sweep/x1.yaml
 '''
 import json
+import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -181,6 +182,7 @@ class Sweep:
                     outcome = experiment.run(seed=int(cell["seed"]), fast_dev_run=fast_dev_run,
                                              force_resume=force_resume)
                 except BaseException as error:
+                    traceback.print_exc()  # inside the sweep's console.log capture
                     self._update_cell(run_id, status="failed",
                                       error=f"{type(error).__name__}: {error}")
                     raise

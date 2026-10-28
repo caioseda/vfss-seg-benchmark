@@ -55,12 +55,21 @@ class DataModuleFromConfig(pl.LightningDataModule):
         shared_dataset_params: Optional[Dict[str, Any]] = None,
         base_kwargs: Optional[Dict[str, Any]] = None,
         train_batch_sampler: Optional[Dict[str, Any]] = None,
+        drop_last_train: bool = False,
     ):
+        '''
+        Args:
+            drop_last_train: drop the last incomplete batch of the plain (shuffled) train loader. A
+                trailing batch of 1 frame crashes any BatchNorm that sees a single value per channel
+                (the DeepLabV3+ ASPP pooling branch: `[1, 256, 1, 1]`). Ignored when a
+                `train_batch_sampler` is set, which owns batch composition.
+        '''
         super().__init__()
 
         self.batch_size = batch_size
         self.num_workers = num_workers if num_workers is not None else batch_size * 2
         self.use_worker_init_fn = use_worker_init_fn
+        self.drop_last_train = drop_last_train
         self.wrap = wrap
 
         # Keep backward compatibility with `base_kwargs` while preferring `shared_dataset_params`.
@@ -214,6 +223,7 @@ class DataModuleFromConfig(pl.LightningDataModule):
             batch_size=self.batch_size,
             num_workers=self.num_workers,
             shuffle=shuffle,
+            drop_last=self.drop_last_train and split == "train",
             generator=self._loader_generator,
             pin_memory=True,
             worker_init_fn=seed_worker if self.use_worker_init_fn else None,

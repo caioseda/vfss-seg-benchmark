@@ -2,6 +2,7 @@ import hashlib
 import json
 import socket
 import subprocess
+import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -417,8 +418,12 @@ class Experiment:
             except BaseException as error:
                 # `last.ckpt` is deliberately left in place: it is what the next attempt resumes
                 # from. Recording the failure is what lets a sweep tell "never ran" from "died".
+                # The traceback is printed HERE, still inside `capture_console_output`: left to the
+                # interpreter it would only appear after the log file closed, i.e. never in it.
+                traceback.print_exc()
                 self.write_run_metadata(status="failed", failed_at=datetime.now().isoformat(),
                                         error=f"{type(error).__name__}: {error}",
+                                        traceback=traceback.format_exc(),
                                         last_step=int(trainer.global_step))
                 raise
             fit_metrics = {
