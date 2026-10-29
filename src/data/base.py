@@ -2,7 +2,7 @@ import copy
 import inspect
 import warnings
 import random
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pytorch_lightning as pl
@@ -25,6 +25,44 @@ class _LenGetItemWrapper:
 
     def __getitem__(self, index: int) -> Any:
         return self.dataset[index]
+
+
+def _identity(sample: Any) -> Any:
+    return sample
+
+
+class _CachedDataset:
+    '''
+    Every sample of `dataset`, loaded once and served from memory.
+
+    Exact only for a deterministic `__getitem__`: a random transform inside the dataset would be
+    frozen at its first draw. The VFSS datasets only decode, min-max normalise and resize (the SSL
+    augmentations run on the batch, inside the LightningModule), so the cached sample is the one
+    `__getitem__` would have returned -- same values, same metadata.
+
+    Attributes not defined here are read from the wrapped dataset, so `video_frame_df` and the
+    samplers' helpers keep working.
+    '''
+
+    def __init__(self, dataset: Any, num_workers: int = 0):
+        self.dataset = dataset
+        # `collate_fn=_identity`, not the default: with `batch_size=None` the default is
+        # `default_convert`, which turns numpy scalars in the metadata into tensors -- the cached
+        # sample would no longer be the one `__getitem__` returns.
+        loader = DataLoader(dataset, batch_size=None, shuffle=False, num_workers=num_workers,
+                            collate_fn=_identity)
+        self._samples = list(loader)
+
+    def __len__(self) -> int:
+        return len(self._samples)
+
+    def __getitem__(self, index: int) -> Any:
+        return self._samples[index]
+
+    def __getattr__(self, name: str) -> Any:
+        if name == "dataset":  # not set yet (e.g. while unpickling): avoid recursing forever
+            raise AttributeError(name)
+        return getattr(self.dataset, name)
 
 
 def seed_worker(worker_id: int) -> None:
@@ -56,6 +94,9 @@ class DataModuleFromConfig(pl.LightningDataModule):
         base_kwargs: Optional[Dict[str, Any]] = None,
         train_batch_sampler: Optional[Dict[str, Any]] = None,
         drop_last_train: bool = False,
+        persistent_train_workers: bool = False,
+        cache_splits: Optional[List[str]] = None,
+        cache_num_workers: int = 8,
     ):
         '''
         Args:
@@ -63,6 +104,28 @@ class DataModuleFromConfig(pl.LightningDataModule):
                 trailing batch of 1 frame crashes any BatchNorm that sees a single value per channel
                 (the DeepLabV3+ ASPP pooling branch: `[1, 256, 1, 1]`). Ignored when a
                 `train_batch_sampler` is set, which owns batch composition.
+            persistent_train_workers: keep the train loader's worker processes alive across epochs
+                instead of forking `num_workers` new ones at every epoch start. Pays off when epochs
+                are short: the E1 tuning trains on one fold (~120 frames, ~15 steps per epoch), and
+                the respawn measured ~2 s per epoch against ~0.05 s per step, i.e. most of the wall
+                time. Train loader only -- validation runs a handful of times per run, and
+                `PatientValidation` builds a fresh val loader each time anyway.
+
+                Not bit-identical to `False`: a persistent iterator draws the workers' base seed from
+                the loader generator once, not once per epoch, so the shuffle order diverges from the
+                second epoch on. Same distribution, different sequence.
+            cache_splits: splits (`train`, `validation`, ...) whose samples are loaded once in
+                `setup` and then served from memory (`_CachedDataset`). A VFSS frame costs ~50 ms to
+                decode and normalise at 1024x1024, and the same ~230 frames are re-read hundreds of
+                times by an E1 tuning run. Memory is ~0.8 MB per frame at 256x256x3 float32, so this
+                is for small splits -- not for the X1 unlabeled pool.
+
+                With every split cached, `num_workers: 0` is the faster setting: the workers no
+                longer have anything to decode, and shipping each batch back over IPC cost more than
+                it saved (measured on the E1 U-Net: 0.125 -> 0.072 s/step).
+            cache_num_workers: worker processes used once, to fill the cache. Separate from
+                `num_workers` so that a cached run can train with `num_workers: 0` and still decode
+                the frames in parallel.
         '''
         super().__init__()
 
@@ -70,6 +133,9 @@ class DataModuleFromConfig(pl.LightningDataModule):
         self.num_workers = num_workers if num_workers is not None else batch_size * 2
         self.use_worker_init_fn = use_worker_init_fn
         self.drop_last_train = drop_last_train
+        self.persistent_train_workers = bool(persistent_train_workers) and self.num_workers > 0
+        self.cache_splits = list(cache_splits or [])
+        self.cache_num_workers = int(cache_num_workers)
         self.wrap = wrap
 
         # Keep backward compatibility with `base_kwargs` while preferring `shared_dataset_params`.
@@ -126,6 +192,12 @@ class DataModuleFromConfig(pl.LightningDataModule):
                 name: _LenGetItemWrapper(dataset)
                 for name, dataset in self.datasets.items()
             }
+        unknown = set(self.cache_splits) - set(self.dataset_configs)
+        if unknown:
+            raise KeyError(f"cache_splits {sorted(unknown)} nao estao configurados "
+                           f"(splits: {sorted(self.dataset_configs)})")
+        for name in self.cache_splits:
+            self.datasets[name] = _CachedDataset(self.datasets[name], num_workers=self.cache_num_workers)
 
         if self.train_batch_sampler_config is not None and "train" in self.datasets:
             labeled_idx, unlabeled_idx = labeled_unlabeled_indices(self.datasets["train"])
@@ -215,6 +287,7 @@ class DataModuleFromConfig(pl.LightningDataModule):
             generator=self._loader_generator,
                 num_workers=self.num_workers,
                 pin_memory=True,
+                persistent_workers=self.persistent_train_workers,
                 worker_init_fn=seed_worker if self.use_worker_init_fn else None,
             )
 
@@ -226,6 +299,7 @@ class DataModuleFromConfig(pl.LightningDataModule):
             drop_last=self.drop_last_train and split == "train",
             generator=self._loader_generator,
             pin_memory=True,
+            persistent_workers=self.persistent_train_workers and split == "train",
             worker_init_fn=seed_worker if self.use_worker_init_fn else None,
         )
 

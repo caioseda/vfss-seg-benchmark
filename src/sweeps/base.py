@@ -15,6 +15,7 @@ A sweep is therefore split in two:
 the cartesian product, the run naming and the per-sample evaluation have working defaults.
 '''
 from itertools import product
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -22,12 +23,21 @@ from omegaconf import DictConfig, OmegaConf
 
 from src.evaluation import evaluate_per_class
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
 
 class SweepPlan:
-    def __init__(self, config: DictConfig):
+    def __init__(self, config: DictConfig, log_dir: Optional[str | Path] = None):
         self.config = config
         self.family: str = config.family
         self.name: str = config.get("name", config.family)
+        # The same root the `Sweep` writes under. Only plans that keep state of their own (an Optuna
+        # study) or read another family's results need it.
+        self.log_dir = Path(log_dir).resolve() if log_dir else PROJECT_ROOT / "logs"
+
+    @property
+    def sweep_dir(self) -> Path:
+        return self.log_dir / self.family / "_sweep"
 
     # ------------------------------------------------------------------ the grid
 
@@ -64,6 +74,26 @@ class SweepPlan:
     def overrides(self, cell: Dict[str, Any]) -> Dict[str, Any]:
         '''Partial config merged over the YAML (`OmegaConf.merge`, so nested keys merge).'''
         raise NotImplementedError
+
+    # ------------------------------------------------------------------ lifecycle hooks
+    #
+    # No-ops for a fixed grid. A plan whose cells are decided while the sweep runs (an Optuna study
+    # asks for the next point only after the previous one reported) hooks in here. The `Sweep` calls
+    # them in this order: `begin` once, then per trained cell `start_cell` -> `overrides`/`callbacks`
+    # -> training -> `evaluate` -> rows appended to the CSV -> `finish_cell`.
+
+    def begin(self, fast_dev_run: bool | int = False) -> None:
+        '''Once per `Sweep.run`, before any cell. Under `fast_dev_run` nothing it sets up may persist.'''
+
+    def start_cell(self, cell: Dict[str, Any]) -> None:
+        '''Right before the cell's `Experiment` is built -- including when the cell is being resumed.'''
+
+    def callbacks(self, cell: Dict[str, Any]) -> List[Any]:
+        '''Lightning callbacks added to this cell's trainer, on top of the ones its YAML declares.'''
+        return []
+
+    def finish_cell(self, cell: Dict[str, Any], experiment, per_sample: pd.DataFrame) -> None:
+        '''After the cell's rows are in the CSV. A crash before this runs must be recoverable from the CSV.'''
 
     # ------------------------------------------------------------------ evaluation
 

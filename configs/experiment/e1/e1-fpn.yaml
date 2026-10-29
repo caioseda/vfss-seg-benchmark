@@ -4,8 +4,9 @@
 # Os cinco configs de configs/experiment/e1/ sao identicos fora do bloco `model`. Rodado sozinho, este
 # YAML executa a rodada 0 do CV com os hiperparametros de referencia. Os sweeps sobrescrevem lr/wd, os
 # folds e o cronograma:
-#   configs/sweep/e1-tuning.yaml  tuning A.1 (treino no fold 0, selecao na validacao fixa, sem teste)
-#   configs/sweep/e1-cv.yaml      Etapa B (CV 5-fold, hiperparametros congelados)
+#   configs/sweep/e1-tuning-search.yaml   tuning A.1, busca TPE (fold 0, 4000 passos, selecao na validacao fixa)
+#   configs/sweep/e1-tuning-confirm.yaml  tuning A.1, top-3 da busca por 8000 passos; a melhor e congelada
+#   configs/sweep/e1-cv.yaml              Etapa B (CV 5-fold, hiperparametros congelados)
 name: e1-fpn
 type: experiment
 
@@ -30,7 +31,7 @@ lit_module:
 optimizer:
   target: torch.optim.AdamW
   params:
-    lr: 1e-3            # referencia; o tuning sorteia, o CV usa o valor congelado
+    lr: 1e-3            # referencia; o tuning busca, o CV usa o valor congelado
     weight_decay: 1e-4
 
 lr_scheduler:
@@ -66,9 +67,15 @@ trainer:
 data:
   target: src.data.base.DataModuleFromConfig
   params:
-    batch_size: 4      # 4 imagens rotuladas por passo; sem TwoStreamBatchSampler e sem pool
+    batch_size: 8      # 8 imagens rotuladas por passo; sem TwoStreamBatchSampler e sem pool
     drop_last_train: True   # lote final de 1 frame quebra BatchNorm (ASPP do DeepLabV3+)
-    num_workers: 8
+    # Cache em RAM + sem workers: o split de tuning tem ~230 frames, e decodificar o PNG 1024x1024 a
+    # cada epoca de ~15 passos (com respawn de 8 workers) era ~75% do tempo de parede. A entrada do
+    # treino e identica bit a bit a de `num_workers: 8` sem cache -- mesma ordem, mesmos pixels
+    # (docs/e1-tuning-desempenho.md).
+    num_workers: 0
+    cache_splits: [train, validation]
+    cache_num_workers: 8     # so para preencher o cache
     wrap: False
     shared_dataset_params:
       dataset_path: /data_ssd/caioseda/data/dataset_inca_all_frames/

@@ -1,0 +1,44 @@
+# E1 / tuning A.1, ETAPA 2 (confirmacao) -- as 3 melhores configuracoes da busca, por 8000 passos.
+# Protocolo: plano_experimental_artigo_atualizado_2026-10-22.md, secao 2.2 (A.1).
+#
+#   scripts/submit.sh configs/sweep/e1-tuning-confirm.yaml
+#
+# So roda com a busca (e1-tuning-search.yaml) COMPLETA: os candidatos sao os `top_k` trials NAO podados
+# de cada arquitetura pelo Dice medio por paciente na validacao. Cada um e retreinado do zero com o
+# cronograma completo (8000 passos, T_max = 8000), sem pruning, no mesmo fold 0 e com a mesma validacao
+# fixa. A melhor por arquitetura e congelada em configs/frozen/e1-hparams.yaml
+# (notebooks/artigo/e1_arquiteturas/e1_01_tuning.ipynb).
+type: sweep
+name: e1-tuning-confirm
+family: e1-tuning-confirm
+plan: src.sweeps.e1.E1ConfirmSweep
+
+source_sweep: configs/sweep/e1-tuning-search.yaml
+top_k: 3
+
+# A grade e (seed, stage1_rank, arch): `stage1_rank` vem de `top_k` e e o eixo mais externo.
+axes:
+  seed: [42]
+  arch: [unet, unetplusplus, fpn, deeplabv3plus, swinunet_tiny]
+
+base_configs:
+  unet:          configs/experiment/e1/e1-unet.yaml
+  unetplusplus:  configs/experiment/e1/e1-unetplusplus.yaml
+  fpn:           configs/experiment/e1/e1-fpn.yaml
+  deeplabv3plus: configs/experiment/e1/e1-deeplabv3plus.yaml
+  swinunet_tiny: configs/experiment/e1/e1-swinunet-tiny.yaml
+
+training:
+  max_steps: 8000
+  val_every_n_steps: 500
+  batch_size: 8
+
+data:
+  split_file: configs/splits/inca-protocolo-s42.csv
+  train_folds: [0]
+
+evaluation:
+  num_classes: 2
+  class_ids: {1: FG}
+
+results_csv: results_per_sample.csv

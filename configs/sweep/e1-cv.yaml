@@ -1,4 +1,5 @@
-# E1 / Etapa B -- CV 5-fold por paciente com os hiperparametros CONGELADOS pelo tuning A.1.
+# E1 / Etapa B -- CV 5-fold por paciente com os hiperparametros CONGELADOS pelo tuning A.1
+# (e1-tuning-search.yaml -> e1-tuning-confirm.yaml).
 # Protocolo: plano_experimental_artigo_atualizado_2026-10-22.md, secao 2.3.
 #
 #   scripts/submit.sh configs/sweep/e1-cv.yaml
@@ -30,7 +31,7 @@ hparams_file: configs/frozen/e1-hparams.yaml
 training:
   max_steps: 8000
   val_every_n_steps: 500
-  batch_size: 4
+  batch_size: 8
 
 data:
   split_file: configs/splits/inca-protocolo-s42.csv

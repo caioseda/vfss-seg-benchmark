@@ -37,6 +37,7 @@ class Experiment:
                  log_dir: Optional[str | Path] = None,
                  family: Optional[str] = None,
                  run_uid: Optional[str] = None,
+                 callbacks: Optional[List[Any]] = None,
             ):
         '''
         Args:
@@ -58,6 +59,9 @@ class Experiment:
                 the same value when re-entering a cell, and that is what makes resuming possible:
                 minting a fresh timestamp on re-entry is exactly what produced the orphan
                 directories `scripts/migrate_logs.py` had to sweep into `_archive/incomplete/`.
+            callbacks: Lightning callback instances added on top of the ones the YAML declares, for
+                callbacks holding live objects a YAML cannot describe -- the Optuna trial the tuning
+                sweep reports to.
         '''
         self.config_path = config_path
         self.config = self._load_config(config_path)
@@ -76,6 +80,7 @@ class Experiment:
         self.parent_dir = Path(self.parent_dir)
         self.family = family
         self._run_uid = run_uid
+        self.extra_callbacks: List[Any] = list(callbacks or [])
 
         # Populated by `run`, so a caller (the X1 notebook) can evaluate the trained model itself.
         self.lit_module: Optional[pl.LightningModule] = None
@@ -375,7 +380,7 @@ class Experiment:
             self.data_module = data_module
 
             callbacks_cfg = self.config.trainer.get("callbacks", [])
-            callbacks = build_callbacks(callbacks_cfg)
+            callbacks = build_callbacks(callbacks_cfg) + self.extra_callbacks
             if not any(isinstance(callback, OverallTrainingProgressBar) for callback in callbacks):
                 callbacks.append(OverallTrainingProgressBar())
 

@@ -1,0 +1,69 @@
+# E1 / tuning A.1, ETAPA 1 (busca) -- lr e weight_decay por arquitetura, Optuna TPE + MedianPruner.
+# Protocolo: plano_experimental_artigo_atualizado_2026-10-22.md, secao 2.2 (A.1).
+#
+#   scripts/submit.sh configs/sweep/e1-tuning-search.yaml
+#
+# Um study por arquitetura (`_sweep/optuna.journal`), 25 trials de 4000 passos cada. Treina SO no fold 0
+# do desenvolvimento (~16 pacientes), reporta o Dice medio por paciente na validacao fixa a cada
+# validacao (o que o MedianPruner usa para podar) e nao carrega teste nenhum. Cada celula grava as linhas
+# por frame da VALIDACAO (eval_set=val, coluna `pruned`) em logs/e1-tuning-search/results_per_sample.csv.
+# Depois: configs/sweep/e1-tuning-confirm.yaml retreina as 3 melhores por 8000 passos.
+type: sweep
+name: e1-tuning-search
+family: e1-tuning-search
+plan: src.sweeps.e1.E1TuningSweep
+
+# `trial` nao entra aqui: vem de `search_space.n_trials` e e o eixo mais externo (seed, trial, arch). Se o
+# orcamento for cortado, todas as arquiteturas ficam com o mesmo numero de trials.
+axes:
+  seed: [42]
+  arch: [unet, unetplusplus, fpn, deeplabv3plus, swinunet_tiny]
+
+base_configs:
+  unet:          configs/experiment/e1/e1-unet.yaml
+  unetplusplus:  configs/experiment/e1/e1-unetplusplus.yaml
+  fpn:           configs/experiment/e1/e1-fpn.yaml
+  deeplabv3plus: configs/experiment/e1/e1-deeplabv3plus.yaml
+  swinunet_tiny: configs/experiment/e1/e1-swinunet-tiny.yaml
+
+search_space:
+  n_trials: 25
+  # A ORDEM das chaves faz parte da semente (o sampler sorteia nessa ordem).
+  params:
+    lr:           {low: 1.0e-5, high: 1.0e-3, log: true}
+    weight_decay: {low: 1.0e-6, high: 1.0e-3, log: true}
+  # Pontos fixos, avaliados ANTES dos propostos pelo TPE e contados dentro de `n_trials`. Vazio por padrao.
+  # Ex.: [{lr: 1.0e-3, weight_decay: 1.0e-4}] inclui a referencia atual como trial 0.
+  fixed_trials: []
+
+optuna:
+  monitor: val/dice_patient   # o que o pruner recebe a cada validacao
+  # TPESampler. Os `n_startup_trials` primeiros sao sorteio aleatorio -- os MESMOS pontos em todas as
+  # arquiteturas, porque a seed do trial n e `seed + n`. `multivariate` modela lr e weight_decay juntos:
+  # no AdamW o decaimento efetivo por passo e lr * weight_decay, entao os dois nao sao independentes.
+  sampler:
+    seed: 42
+    n_startup_trials: 10
+    multivariate: true
+  # MedianPruner: poda um trial cujo melhor valor ate o passo s esta abaixo da mediana dos trials
+  # COMPLETOS no passo s. Desligado ate 5 trials completos e antes do passo 1000 (2 validacoes): a
+  # curva dos primeiros 500 passos, ainda no topo do cosseno, nao ordena bem as configuracoes.
+  pruner:
+    n_startup_trials: 5
+    n_warmup_steps: 1000
+    interval_steps: 1
+
+training:
+  max_steps: 4000          # e T_max do cosseno: cada trial percorre o cronograma inteiro, mais curto
+  val_every_n_steps: 500   # vira trainer.val_check_interval; 8 reportes por trial
+  batch_size: 8
+
+data:
+  split_file: configs/splits/inca-protocolo-s42.csv
+  train_folds: [0]
+
+evaluation:
+  num_classes: 2
+  class_ids: {1: FG}   # 0=fundo, 1=estrutura (C2..C8 fundidas por binary_all)
+
+results_csv: results_per_sample.csv

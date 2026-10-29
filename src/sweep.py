@@ -53,8 +53,8 @@ class Sweep:
     def __init__(self, config_path: str | Path, log_dir: Optional[str | Path] = None):
         self.config_path = _resolve_sweep_config(config_path)
         self.config = self._load_config(self.config_path)
-        self.plan = get_obj_from_str(str(self.config.plan))(self.config)
         self.log_dir = Path(log_dir).resolve() if log_dir else (PROJECT_ROOT / "logs")
+        self.plan = get_obj_from_str(str(self.config.plan))(self.config, log_dir=self.log_dir)
         self.family_dir = self.log_dir / self.plan.family
         self.sweep_dir = self.family_dir / "_sweep"
         self.state_path = self.sweep_dir / "state.json"
@@ -157,6 +157,7 @@ class Sweep:
                 print("\n--dry-run: nada foi treinado.")
                 return []
 
+            self.plan.begin(fast_dev_run=fast_dev_run)
             results: List[Dict[str, Any]] = []
             for cell in tqdm(cells, desc=f"grade {self.plan.name}", unit="cell"):
                 run_id = self.plan.run_id(cell)
@@ -169,12 +170,14 @@ class Sweep:
                 attempts = int(state["cells"].get(run_id, {}).get("attempts", 0)) + 1
                 tqdm.write(f"[treina] {run_id}  (tentativa {attempts}, uid {run_uid})")
 
+                self.plan.start_cell(cell)
                 experiment = Experiment(
                     config_path=self.plan.experiment_config(cell),
                     overrides=self.plan.overrides(cell),
                     log_dir=self.log_dir,
                     family=self.plan.family,
                     run_uid=run_uid,
+                    callbacks=self.plan.callbacks(cell),
                 )
                 self._update_cell(run_id, status="running", run_uid=run_uid, cell=cell,
                                   run_name=self.plan.run_name(cell), attempts=attempts)
@@ -200,6 +203,9 @@ class Sweep:
                     attach_published_metrics(experiment.tracking_config,
                                              experiment.experiment_run_dir,
                                              experiment.tracking_logs_root)
+                # Depois da CSV, nunca antes: se o processo cair entre os dois, a CSV ja diz o que
+                # aconteceu e o plano reconcilia no proximo `begin`.
+                self.plan.finish_cell(cell, experiment, per_sample)
 
                 self._update_cell(run_id, status="done",
                                   run_dir=str(experiment.experiment_run_dir),
