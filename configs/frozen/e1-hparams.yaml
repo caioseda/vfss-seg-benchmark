@@ -1,0 +1,34 @@
+# Gerado por src.tuning.write_frozen_hparams. Nao editar a mao: e o registro do congelamento.
+frozen_at: '2026-10-30T12:21:30'
+source: '/data_ssd/caioseda/projetos/vfss-seg-benchmark/logs/e1-tuning-confirm/results_per_sample.csv
+  (busca: /data_ssd/caioseda/projetos/vfss-seg-benchmark/logs/e1-tuning-search/results_per_sample.csv)'
+selection:
+  metric: dice
+  aggregation: patient
+  eval_set: val
+hparams:
+  deeplabv3plus:
+    lr: 0.0002987741102824
+    weight_decay: 3.681754774371584e-06
+    trial: 22
+    val_dice_patient: 0.8146269267717661
+  fpn:
+    lr: 0.0009786797433836
+    weight_decay: 0.0008590701799409
+    trial: 18
+    val_dice_patient: 0.8280585119029517
+  swinunet_tiny:
+    lr: 0.0001122108420877
+    weight_decay: 4.654124666380519e-05
+    trial: 15
+    val_dice_patient: 0.7327742081300904
+  unet:
+    lr: 0.0007913757973244
+    weight_decay: 5.583406770655286e-05
+    trial: 16
+    val_dice_patient: 0.8196526168632289
+  unetplusplus:
+    lr: 0.0003695427629909
+    weight_decay: 8.026036272969121e-05
+    trial: 4
+    val_dice_patient: 0.8293341129808212
