@@ -65,7 +65,7 @@ class Sweep:
     @staticmethod
     def _load_config(config_path: Path) -> DictConfig:
         config = OmegaConf.load(str(_resolve_config_path(config_path)))
-        for field in ("type", "plan", "family", "axes"):
+        for field in ("type", "family", "plan", "axes"):
             if field not in config:
                 raise ValueError(f"Falta o campo obrigatorio `{field}` em {config_path}")
         if str(config.type) != "sweep":

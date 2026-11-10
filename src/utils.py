@@ -3,7 +3,7 @@ import re
 import sys
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
-from typing import Any, Dict, Iterator, TextIO, Union
+from typing import Any, Dict, Iterator, TextIO, Union, Generator, Iterator
 
 import torch
 import os

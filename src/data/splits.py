@@ -245,3 +245,6 @@ def assign_protocol_split(
     df = df.copy()
     df[split_column] = key.map(split_of)
     return df
+
+
+    

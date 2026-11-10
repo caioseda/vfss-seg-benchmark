@@ -15,8 +15,8 @@ plan: src.sweeps.e1.E1CVSweep
 # `fold` mais externo: se a grade for cortada, as arquiteturas concluidas seguem pareadas fold a fold.
 axes:
   seed: [42]
-  fold: [0, 1, 2, 3, 4]
   arch: [unet, unetplusplus, fpn, deeplabv3plus, swinunet_tiny]
+  fold: [0, 1, 2, 3, 4]
 
 base_configs:
   unet:          configs/experiment/e1/e1-unet.yaml
