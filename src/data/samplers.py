@@ -72,8 +72,9 @@ class TwoStreamBatchSampler(Sampler[List[int]]):
     def __init__(self,
                  labeled_indices: Sequence[int],
                  unlabeled_indices: Sequence[int],
-                 batch_size: int,
-                 labeled_batch_size: int,
+                 batch_size: Optional[int] = None,
+                 labeled_batch_size: int = 1,
+                 unlabeled_batch_size: Optional[int] = None,
                  shuffle: bool = True,
                  seed: Optional[int] = None,
                  unlabeled_policy: str = "global",
@@ -84,6 +85,11 @@ class TwoStreamBatchSampler(Sampler[List[int]]):
             labeled_indices / unlabeled_indices: dataset row positions of each stream. Injected by
                 `DataModuleFromConfig` from the training dataset.
             batch_size / labeled_batch_size: batch composition; the remainder is the unlabeled slots.
+            unlabeled_batch_size: alternative to `batch_size` -- say the two streams explicitly
+                (`labeled_batch_size=8, unlabeled_batch_size=8`). When both are given they must agree.
+                Every index emitted is a **central frame**; datasets that need temporal neighbours
+                (`VFSSTemporalNeighborsDataset`) attach them per sample, so the batch composition,
+                the per-epoch seed and the resume state stay those of the centrals.
             shuffle: shuffle the labeled pass order each epoch.
             seed: base seed; the per-epoch RNG is `seed + epoch`, so a run is reproducible and two
                 policies sharing a seed see the *same labeled batches*.
@@ -95,6 +101,17 @@ class TwoStreamBatchSampler(Sampler[List[int]]):
         '''
         if not labeled_indices:
             raise ValueError("labeled_indices must be non-empty.")
+        if unlabeled_batch_size is not None:
+            if int(unlabeled_batch_size) < 0:
+                raise ValueError("unlabeled_batch_size must be >= 0.")
+            implied = int(labeled_batch_size) + int(unlabeled_batch_size)
+            if batch_size is not None and int(batch_size) != implied:
+                raise ValueError(
+                    f"batch_size={batch_size} disagrees with labeled_batch_size + unlabeled_batch_size = {implied}."
+                )
+            batch_size = implied
+        if batch_size is None:
+            raise ValueError("Pass batch_size or unlabeled_batch_size.")
         if not unlabeled_indices:
             raise ValueError("unlabeled_indices must be non-empty (use a plain DataLoader if there is no unlabeled data).")
         if not (0 < labeled_batch_size <= batch_size):

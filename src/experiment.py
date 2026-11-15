@@ -13,7 +13,7 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 from pytorch_lightning.callbacks import ModelCheckpoint
 
-from src.callbacks import OverallTrainingProgressBar, ResumeFidelity, build_callbacks
+from src.callbacks import OverallTrainingProgressBar, ResourceMonitor, ResumeFidelity, build_callbacks
 from src.tracking import build_loggers, infer_logs_root, resolve_tracking_config
 from src.models import LitWrapper
 from src.utils import (
@@ -90,6 +90,8 @@ class Experiment:
         # Preenchidos por `setup_loggers`; o `Sweep` os usa para anexar o numero publicado.
         self.tracking_config: Dict[str, Any] = {}
         self.tracking_logs_root: Optional[Path] = None
+        # Preenchido por `run` quando há um `ResourceMonitor` entre os callbacks.
+        self.resources: Optional[Dict[str, Any]] = None
 
 
     def setup_exeperiment_run_dir(self) -> None:
@@ -462,6 +464,13 @@ class Experiment:
             if not fast_dev_run and self.last_checkpoint_path.exists():
                 self.last_checkpoint_path.unlink()
 
+            # Custo do run (tempo, VRAM, tamanho do modelo), quando o YAML declara um ResourceMonitor.
+            self.resources = None
+            monitor = next((c for c in callbacks if isinstance(c, ResourceMonitor)), None)
+            if monitor is not None:
+                self.resources = monitor.summary()
+                self.write_run_metadata(resources=self.resources)
+
             self.write_run_metadata(
                 status="done", finished_at=datetime.now().isoformat(),
                 final_step=int(trainer.global_step),
@@ -478,6 +487,7 @@ class Experiment:
             "family": self.family,
             "fit_metrics": {k: _to_scalar(v) for k, v in fit_metrics.items()},
             "test_metrics": {k: _to_scalar(v) for k, v in test_metrics.items()},
+            "resources": self.resources,
         }
 
 

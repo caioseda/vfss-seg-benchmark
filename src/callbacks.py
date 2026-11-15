@@ -1,3 +1,7 @@
+import os
+import re
+import time
+import torch
 from lightning_fabric.utilities.seed import _collect_rng_states, _set_rng_states
 from pytorch_lightning.callbacks import Callback
 from src.utils import instantiate_from_config
@@ -293,3 +297,282 @@ class ResumeFidelity(Callback):
             return
         _set_rng_states(self._pending_rng_states)
         self._pending_rng_states = None
+
+
+class ResourceMonitor(Callback):
+    '''
+    Custo de um run, para comparar métodos além da acurácia: tempo, VRAM, tamanho do modelo e carga
+    por passo. Escrito para o E2, onde os métodos diferem justamente no custo (o teacher do MT dobra os
+    pesos em memória; a variante temporal bidirecional passa 3x mais imagens pelo teacher; o fluxo óptico
+    roda nos workers e pode deixar a GPU esperando).
+
+    O que mede:
+      tempo    parede do fit, treino sem validação, validação, teste; s/iteração (média, p50, p95);
+               espera por dados = intervalo entre o fim de um passo e o início do próximo (o loader
+               não entregou o batch a tempo). Sem `cuda.synchronize` por passo -- sincronizar distorceria
+               o próprio tempo medido; os totais são exatos, os percentis por iteração são aproximados.
+      VRAM     `max_memory_allocated`/`max_memory_reserved` separados por fase (treino, validação, teste),
+               com reset entre fases. `sys/vram_peak_gb` também é logado a cada `log_every_n_steps`.
+      modelo   parâmetros do student (totais/treináveis), do teacher quando existe, GFLOPs por frame
+               (`torch.utils.flop_counter`, entrada 1 x C x `input_size`^2), tamanho do melhor checkpoint
+               e passo em que ele foi salvo.
+      carga    imagens por passo por rede, lidas de `pl_module.forward_counts` (ver
+               `SemiSupervisedLitWrapper.count_forward`).
+      latência inferência por frame, batch 1 e batch 8, pelo caminho de avaliação (`_eval_forward`, o
+               teacher no MT), com sincronização -- aqui ela é necessária.
+
+    Os acumulados viajam no checkpoint (`state_dict`), então um run retomado soma o tempo de todas as
+    tentativas. `summary()` é o que `Experiment.run` grava em `run.json` (`resources`) e o que a tabela
+    comparativa lê.
+    '''
+
+    def __init__(self, input_size: int = 256, log_every_n_steps: int = 50,
+                 latency_batch_sizes=(1, 8), latency_iters: int = 20, measure_flops: bool = True):
+        super().__init__()
+        self.input_size = int(input_size)
+        self.log_every_n_steps = int(log_every_n_steps)
+        self.latency_batch_sizes = [int(b) for b in latency_batch_sizes]
+        self.latency_iters = int(latency_iters)
+        self.measure_flops = bool(measure_flops)
+
+        # Acumulados (persistidos).
+        self.totals = {"fit_s": 0.0, "train_s": 0.0, "val_s": 0.0, "data_wait_s": 0.0, "steps": 0,
+                       "attempts": 0}
+        self.iteration_s: list = []
+        self.images: dict = {}
+        self.peaks = {"train_alloc": 0.0, "train_reserved": 0.0, "val_alloc": 0.0, "test_alloc": 0.0}
+        # Por tentativa.
+        self._fit_start = None
+        self._phase_start = None
+        self._last_batch_end = None
+        self._batch_start = None
+        self.static: dict = {}
+
+    # ------------------------------------------------------------------ persistence
+
+    def state_dict(self) -> dict:
+        totals = dict(self.totals)
+        if self._fit_start is not None:
+            totals["fit_s"] += time.perf_counter() - self._fit_start
+        return {"totals": totals, "iteration_s": list(self.iteration_s), "images": dict(self.images),
+                "peaks": dict(self.peaks)}
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        self.totals.update(state_dict.get("totals", {}))
+        self.iteration_s = list(state_dict.get("iteration_s", []))
+        self.images = dict(state_dict.get("images", {}))
+        self.peaks.update(state_dict.get("peaks", {}))
+
+    # ------------------------------------------------------------------ helpers
+
+    @staticmethod
+    def _cuda() -> bool:
+        return torch.cuda.is_available()
+
+    def _read_peak(self) -> tuple:
+        if not self._cuda():
+            return 0.0, 0.0
+        return (torch.cuda.max_memory_allocated() / 1024 ** 3, torch.cuda.max_memory_reserved() / 1024 ** 3)
+
+    def _reset_peak(self) -> None:
+        if self._cuda():
+            torch.cuda.reset_peak_memory_stats()
+
+    def _close_train_window(self) -> None:
+        if self._phase_start is not None:
+            self.totals["train_s"] += time.perf_counter() - self._phase_start
+            self._phase_start = None
+        alloc, reserved = self._read_peak()
+        self.peaks["train_alloc"] = max(self.peaks["train_alloc"], alloc)
+        self.peaks["train_reserved"] = max(self.peaks["train_reserved"], reserved)
+
+    @staticmethod
+    def _count_params(module) -> tuple:
+        total = sum(p.numel() for p in module.parameters())
+        trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
+        return total, trainable
+
+    def _example_input(self, pl_module, batch_size: int):
+        channels = int(getattr(getattr(pl_module, "model", None), "n_channels", 3) or 3)
+        return torch.randn(batch_size, channels, self.input_size, self.input_size, device=pl_module.device)
+
+    @torch.no_grad()
+    def _measure_static(self, pl_module) -> None:
+        network = getattr(pl_module, "model", pl_module)
+        total, trainable = self._count_params(network)
+        self.static["params_total_m"] = total / 1e6
+        self.static["params_trainable_m"] = trainable / 1e6
+        teacher = getattr(pl_module, "teacher", None)
+        self.static["teacher_params_m"] = (self._count_params(teacher)[0] / 1e6) if teacher is not None else 0.0
+        all_total, all_trainable = self._count_params(pl_module)
+        self.static["module_params_total_m"] = all_total / 1e6
+        self.static["module_params_trainable_m"] = all_trainable / 1e6
+        if self.measure_flops:
+            try:
+                from torch.utils.flop_counter import FlopCounterMode
+                was_training = network.training
+                network.eval()
+                counter = FlopCounterMode(display=False)
+                with counter:
+                    network(self._example_input(pl_module, 1))
+                network.train(was_training)
+                self.static["gflops_per_frame"] = counter.get_total_flops() / 1e9
+            except Exception as error:  # medir FLOPs nunca pode derrubar um treino
+                print(f"ResourceMonitor: FLOPs nao medidos ({type(error).__name__}: {error})")
+                self.static["gflops_per_frame"] = float("nan")
+
+    @torch.no_grad()
+    def _measure_latency(self, pl_module) -> None:
+        forward = getattr(pl_module, "_eval_forward", None) or pl_module.forward
+        was_training = pl_module.training
+        pl_module.eval()
+        for batch_size in self.latency_batch_sizes:
+            x = self._example_input(pl_module, batch_size)
+            for _ in range(3):
+                forward(x)
+            if self._cuda():
+                torch.cuda.synchronize()
+            start = time.perf_counter()
+            for _ in range(self.latency_iters):
+                forward(x)
+            if self._cuda():
+                torch.cuda.synchronize()
+            elapsed = (time.perf_counter() - start) / self.latency_iters
+            self.static[f"latency_ms_per_frame_bs{batch_size}"] = 1000.0 * elapsed / batch_size
+        pl_module.train(was_training)
+
+    # ------------------------------------------------------------------ fit
+
+    def on_fit_start(self, trainer, pl_module):
+        self.totals["attempts"] = int(self.totals.get("attempts", 0)) + 1
+        self._fit_start = time.perf_counter()
+        self._measure_static(pl_module)
+        self.static["gpu"] = torch.cuda.get_device_name(0) if self._cuda() else "cpu"
+        self.static["torch"] = torch.__version__
+        self.static["precision"] = str(getattr(trainer, "precision", ""))
+        self.static["num_workers"] = getattr(trainer.datamodule, "num_workers", None) if trainer.datamodule else None
+
+    def on_train_start(self, trainer, pl_module):
+        self._reset_peak()
+        self._phase_start = time.perf_counter()
+        self._last_batch_end = None
+
+    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
+        now = time.perf_counter()
+        if self._phase_start is None:  # primeiro passo depois de uma validação
+            self._phase_start = now
+        if self._last_batch_end is not None:
+            self.totals["data_wait_s"] += now - self._last_batch_end
+        self._batch_start = now
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        now = time.perf_counter()
+        if self._last_batch_end is not None:
+            self.iteration_s.append(now - self._last_batch_end)
+        elif self._batch_start is not None:
+            self.iteration_s.append(now - self._batch_start)
+        self._last_batch_end = now
+        self.totals["steps"] += 1
+        for network, count in dict(getattr(pl_module, "forward_counts", {}) or {}).items():
+            self.images[network] = self.images.get(network, 0) + int(count)
+        if self.log_every_n_steps and trainer.global_step % self.log_every_n_steps == 0 and self._cuda():
+            pl_module.log("sys/vram_peak_gb", torch.cuda.max_memory_allocated() / 1024 ** 3,
+                          on_step=True, on_epoch=False, logger=True)
+
+    def on_validation_start(self, trainer, pl_module):
+        if trainer.sanity_checking:
+            return
+        if trainer.state.fn == "fit":
+            self._close_train_window()
+        self._reset_peak()
+        self._val_start = time.perf_counter()
+
+    def on_validation_end(self, trainer, pl_module):
+        if trainer.sanity_checking:
+            return
+        self.totals["val_s"] += time.perf_counter() - getattr(self, "_val_start", time.perf_counter())
+        self.peaks["val_alloc"] = max(self.peaks["val_alloc"], self._read_peak()[0])
+        self._reset_peak()
+        self._last_batch_end = None  # o intervalo da validação não é espera por dados
+
+    def on_train_end(self, trainer, pl_module):
+        self._close_train_window()
+
+    def on_fit_end(self, trainer, pl_module):
+        if self._fit_start is not None:
+            self.totals["fit_s"] += time.perf_counter() - self._fit_start
+            self._fit_start = None
+        for callback in trainer.checkpoint_callbacks:
+            best = getattr(callback, "best_model_path", "")
+            if getattr(callback, "monitor", None) and best and os.path.exists(best):
+                self.static["checkpoint_mb"] = os.path.getsize(best) / 1024 ** 2
+                # Lido do checkpoint, não do nome do arquivo: os wrappers SSL logam uma métrica
+                # `step` própria, e é ela (não o global_step) que o `{step}` do nome formata.
+                try:
+                    self.static["best_step"] = int(torch.load(best, map_location="cpu",
+                                                              weights_only=False)["global_step"])
+                except Exception:
+                    match = re.search(r"step=(\d+)", os.path.basename(best))
+                    self.static["best_step"] = int(match.group(1)) if match else None
+                break
+        metrics = {f"sys/{k}": float(v) for k, v in self.summary().items()
+                   if isinstance(v, (int, float)) and not isinstance(v, bool) and v == v}
+        for logger in trainer.loggers:
+            try:
+                logger.log_metrics(metrics, step=trainer.global_step)
+            except Exception as error:
+                print(f"ResourceMonitor: {type(logger).__name__} recusou as metricas ({error})")
+
+    # ------------------------------------------------------------------ test
+
+    def on_test_start(self, trainer, pl_module):
+        self._reset_peak()
+        self._test_start = time.perf_counter()
+
+    def on_test_end(self, trainer, pl_module):
+        self.static["test_s"] = time.perf_counter() - getattr(self, "_test_start", time.perf_counter())
+        self.peaks["test_alloc"] = max(self.peaks["test_alloc"], self._read_peak()[0])
+        self.measure_latency(pl_module)
+
+    def measure_latency(self, pl_module) -> None:
+        '''
+        Latência de inferência, medida DEPOIS do treino (no fim do teste, ou chamada por quem avalia).
+        Medir no fim do fit pegava os workers persistentes do treino ainda vivos disputando CPU, e a
+        DeepLabV3+ aparecia 20x mais lenta do que é isolada.
+        '''
+        try:
+            self._measure_latency(pl_module)
+        except Exception as error:
+            print(f"ResourceMonitor: latencia nao medida ({type(error).__name__}: {error})")
+
+    # ------------------------------------------------------------------ report
+
+    def summary(self) -> dict:
+        steps = max(int(self.totals["steps"]), 1)
+        iterations = sorted(self.iteration_s)
+
+        def percentile(q: float) -> float:
+            if not iterations:
+                return float("nan")
+            return float(iterations[min(int(q * len(iterations)), len(iterations) - 1)])
+
+        out = {
+            "fit_wall_s": float(self.totals["fit_s"]),
+            "train_s": float(self.totals["train_s"]),
+            "val_s": float(self.totals["val_s"]),
+            "steps": int(self.totals["steps"]),
+            "attempts": int(self.totals.get("attempts", 0)),
+            "s_per_step_mean": float(self.totals["train_s"]) / steps,
+            "s_per_step_p50": percentile(0.50),
+            "s_per_step_p95": percentile(0.95),
+            "data_wait_s": float(self.totals["data_wait_s"]),
+            "data_wait_frac": float(self.totals["data_wait_s"]) / max(float(self.totals["train_s"]), 1e-9),
+            "vram_train_peak_gb": self.peaks["train_alloc"],
+            "vram_train_reserved_gb": self.peaks["train_reserved"],
+            "vram_val_peak_gb": self.peaks["val_alloc"],
+            "vram_test_peak_gb": self.peaks["test_alloc"],
+        }
+        for network, count in self.images.items():
+            out[f"images_per_step_{network}"] = count / steps
+        out.update(self.static)
+        return out

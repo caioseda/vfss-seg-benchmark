@@ -75,6 +75,7 @@ class MeanTeacherLitWrapper(SemiSupervisedLitWrapper):
         teacher_inputs = gaussian_noise(unlabeled_images, std=self.noise_std, clamp=self.noise_clamp)
         with torch.no_grad():
             teacher_soft = torch.softmax(self.teacher(teacher_inputs), dim=1)
+        self.count_forward("teacher", teacher_inputs.shape[0])
 
         # The teacher only perturbs intensities -- no geometry -- so its output is already aligned
         # with the hidden ground truth and can be scored against it directly.

@@ -33,9 +33,11 @@ def main() -> int:
                         help="retoma mesmo se a configuracao mudou desde a tentativa anterior")
     parser.add_argument("--fast-dev-run", nargs="?", const=True, default=False, type=int,
                         help="fast_dev_run do Lightning; nao grava resultados")
+    parser.add_argument("--set", nargs="*", default=[], metavar="CHAVE=VALOR",
+                        help="sobrescritas da config do sweep, em dotlist (ex.: axes.arch=[fpn])")
     args = parser.parse_args()
 
-    sweep = Sweep(args.config, log_dir=args.log_dir)
+    sweep = Sweep(args.config, log_dir=args.log_dir, overrides=args.set)
     sweep.run(fast_dev_run=args.fast_dev_run, force_resume=args.force_resume, dry_run=args.dry_run)
     return 0
 

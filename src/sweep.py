@@ -49,10 +49,36 @@ def _resolve_sweep_config(config_path: str | Path) -> Path:
     return candidate if candidate.exists() else path
 
 
+def _normalize_overrides(overrides) -> List[str]:
+    '''
+    `{"axes.arch": ["fpn"], "training.max_steps": 200}` ou `["axes.arch=[fpn]"]` -> dotlist do OmegaConf.
+
+    O dotlist é a forma que atravessa a fronteira de processo: `submit_sweep` a passa como `--set` para
+    `scripts/run_sweep.py`, então o notebook e o processo do tmux enxergam a MESMA grade.
+    '''
+    if not overrides:
+        return []
+    if isinstance(overrides, dict):
+        import yaml
+        return [f"{key}={yaml.safe_dump(value, default_flow_style=True).strip().removesuffix('...').strip()}"
+                for key, value in overrides.items()]
+    return [str(item) for item in overrides]
+
+
 class Sweep:
-    def __init__(self, config_path: str | Path, log_dir: Optional[str | Path] = None):
+    def __init__(self, config_path: str | Path, log_dir: Optional[str | Path] = None,
+                 overrides: Optional[Dict[str, Any] | List[str]] = None):
+        '''
+        Args:
+            overrides: sobrescritas da config do SWEEP (não do experimento), como dict de chaves com
+                pontos ou dotlist -- ex. `{"axes.arch": ["fpn"]}` para rodar o E2 com outra arquitetura
+                sem editar o YAML.
+        '''
         self.config_path = _resolve_sweep_config(config_path)
         self.config = self._load_config(self.config_path)
+        self.overrides = _normalize_overrides(overrides)
+        if self.overrides:
+            self.config = OmegaConf.merge(self.config, OmegaConf.from_dotlist(self.overrides))
         self.log_dir = Path(log_dir).resolve() if log_dir else (PROJECT_ROOT / "logs")
         self.plan = get_obj_from_str(str(self.config.plan))(self.config, log_dir=self.log_dir)
         self.family_dir = self.log_dir / self.plan.family
@@ -219,7 +245,7 @@ class Sweep:
 # ---------------------------------------------------------------------- notebooks
 
 def submit_sweep(config_path: str | Path, session: Optional[str] = None,
-                 extra_args: tuple = ()) -> str:
+                 extra_args: tuple = (), overrides: Optional[Dict[str, Any] | List[str]] = None) -> str:
     '''
     Lanca um sweep numa sessao tmux destacada e devolve NA HORA.
 
@@ -233,6 +259,10 @@ def submit_sweep(config_path: str | Path, session: Optional[str] = None,
     import subprocess
 
     script = PROJECT_ROOT / "scripts" / "submit.sh"
+    extra_args = tuple(extra_args)
+    dotlist = _normalize_overrides(overrides)
+    if dotlist:
+        extra_args += ("--set", *dotlist)
     command = [str(script), str(config_path)]
     if session or extra_args:
         command.append(session or Path(config_path).stem)
@@ -248,13 +278,14 @@ def submit_sweep(config_path: str | Path, session: Optional[str] = None,
     return session or Path(config_path).stem
 
 
-def sweep_status(config_path: str | Path, log_dir: Optional[str | Path] = None) -> pd.DataFrame:
+def sweep_status(config_path: str | Path, log_dir: Optional[str | Path] = None,
+                 overrides: Optional[Dict[str, Any] | List[str]] = None) -> pd.DataFrame:
     '''Estado atual de cada celula da grade, lido do disco. Nao depende do processo estar vivo.'''
-    return Sweep(config_path, log_dir=log_dir).plan_summary()
+    return Sweep(config_path, log_dir=log_dir, overrides=overrides).plan_summary()
 
 
 def watch_sweep(config_path: str | Path, interval: int = 30, log_dir: Optional[str | Path] = None,
-                tail: int = 3) -> None:
+                tail: int = 3, overrides: Optional[Dict[str, Any] | List[str]] = None) -> None:
     '''
     Acompanha um sweep lendo `_sweep/state.json` e o fim do `console.log`.
 
@@ -265,7 +296,7 @@ def watch_sweep(config_path: str | Path, interval: int = 30, log_dir: Optional[s
     '''
     import time
 
-    sweep = Sweep(config_path, log_dir=log_dir)
+    sweep = Sweep(config_path, log_dir=log_dir, overrides=overrides)
     console_log = sweep.sweep_dir / "console.log"
     try:
         from IPython.display import clear_output

@@ -369,6 +369,7 @@ class VFSSFrameDatasetBase(Dataset):
                  split_file: Optional[Union[str, Path]] = None,
                  train_folds: Optional[Sequence[int]] = None,
                  cv_fold: Optional[int] = None,
+                 holdout_test: bool = False,
                  label_fraction: float = 1.0,
                  label_frames_per_group: Optional[int] = None,
                  label_seed: int = 42,
@@ -405,7 +406,10 @@ class VFSSFrameDatasetBase(Dataset):
             train_folds (Sequence[int], optional): Folds do desenvolvimento usados como 'train' em `split_mode='protocol'`.
                 None usa todos os folds exceto `cv_fold` (o tuning A.1 passa `[0]`).
             cv_fold (int, optional): Fold do desenvolvimento retido para avaliação; vira o split 'test'. None deixa
-                o split 'test' vazio -- o teste INCA nunca é exposto por este modo.
+                o split 'test' vazio -- o teste INCA só é exposto com `holdout_test=True`.
+            holdout_test (bool): Só em `split_mode='protocol'`, e só sem `cv_fold`: o split 'test' passa a ser a
+                partição de TESTE INCA. É o treino final (E2): todos os folds em 'train', seleção na validação
+                fixa, avaliação única no teste. Tuning e CV nunca ligam esta flag.
             label_fraction (float): Fração (por `label_group_column`) dos frames de `label_regime_splits` que mantêm
                 o rótulo revelado; o restante é marcado `is_labeled=False` mas continua no dataset (não é descartado).
                 Regimes são aninhados para um `label_seed` fixo: ver `apply_label_regime`. Ignorado quando
@@ -468,22 +472,26 @@ class VFSSFrameDatasetBase(Dataset):
         elif split_mode == "protocol":
             if split_file is None:
                 raise ValueError("split_mode='protocol' requires `split_file`.")
-            if split == "test" and cv_fold is None:
+            if split == "test" and cv_fold is None and not holdout_test:
                 # Without a held-out fold this split would be empty -- and the only other patients
                 # it could ever hold are the INCA test set, which no tuning or CV run may load.
                 raise ValueError(
                     "split='test' with split_mode='protocol' requires `cv_fold`: the INCA test set "
-                    "is not reachable from this mode. Drop the `test` dataset for tuning runs."
+                    "is only reachable with `holdout_test=True` (final training). Drop the `test` "
+                    "dataset for tuning runs."
                 )
             self.split_file = resolve_project_path(split_file)
             self.train_folds = None if train_folds is None else [int(f) for f in train_folds]
             self.cv_fold = None if cv_fold is None else int(cv_fold)
+            self.holdout_test = bool(holdout_test)
             self.video_frame_df = assign_protocol_split(
                 self.video_frame_df, load_protocol_split(self.split_file),
                 train_folds=self.train_folds, cv_fold=self.cv_fold, group_column=split_group_column,
+                holdout_test=self.holdout_test,
             )
             logger.info(
-                f"Protocol split from {self.split_file} (train_folds={self.train_folds}, cv_fold={self.cv_fold})."
+                f"Protocol split from {self.split_file} (train_folds={self.train_folds}, cv_fold={self.cv_fold}, "
+                f"holdout_test={self.holdout_test})."
             )
         else:
             self.split_seed = split_seed
@@ -951,6 +959,161 @@ class VFSSWindowImageDataset(VFSSFrameDatasetBase):
             metadata['has_hidden_target'] = has_target
 
         return returns
+
+
+NEIGHBORS_FOR = ("unlabeled", "all")
+
+
+class VFSSTemporalNeighborsDataset(VFSSWindowImageDataset):
+    '''
+    Cada amostra é um **frame central**; para os centrais não rotulados, o dataset anexa os vizinhos
+    temporais REAIS (lidos do disco) e o que é preciso para transportar uma predição de cada vizinho
+    para o centro -- a consistência temporal do E2 (`TemporalMeanTeacherLitWrapper`).
+
+    O sampler (`TwoStreamBatchSampler`) continua emitindo só índices de centrais. Os vizinhos viajam
+    junto com o central, não como linhas do batch: isso mantém intactos a composição do lote, a seed
+    por época e o `state_dict` de retomada do sampler.
+
+    Chaves acrescentadas, com K = len(neighbor_offsets):
+        neighbors            [K,C,H,W]  mesmo pré-processamento da entrada do modelo
+        neighbor_flow        [K,2,H,W]  fluxo de amostragem em pixels, na convenção `warp_convention`
+                                       (ver `src/data/optical_flow.py`)
+        neighbor_confidence  [K,1,H,W]  M_noc = exp(-alpha*|I_t - W(I_n)|)
+        neighbor_valid       [K] bool   False fora do vídeo e nas linhas que não carregam vizinhos
+        metadata['neighbor_frame_ids']  lista de K ints, -1 quando inválido
+
+    Um vizinho fora do vídeo é marcado inválido em vez de repetir a borda (`boundary_mode='repeat'` da
+    janela): repetir o próprio frame daria uma consistência trivialmente satisfeita.
+
+    Com `neighbor_offsets=[]` o dataset é idêntico a `VFSSWindowImageDataset`.
+    '''
+
+    def __init__(self,
+                 neighbor_offsets: Sequence[int] = (-1,),
+                 neighbor_gap: int = 1,
+                 neighbors_for: str = "unlabeled",
+                 flow_method: str = "farneback",
+                 flow_preprocess: str = "vfss",
+                 warp_convention: str = "dtc_trus",
+                 noc_alpha: Optional[float] = None,
+                 farneback_params: Optional[dict] = None,
+                 farneback_median_ksize: int = 3,
+                 **kwargs):
+        '''
+        Args:
+            neighbor_offsets: deslocamentos, em unidades de `neighbor_gap`, dos vizinhos do central.
+                `[-1]` = só o anterior; `[-1, 1]` = bidirecional; `[-3,-2,-1,1,2,3]` = janela maior.
+            neighbor_gap: distância em frames de um deslocamento unitário (o `T`/`g` do notebook).
+            neighbors_for: `unlabeled` (só os centrais sem rótulo revelado, que são os que a perda
+                temporal usa) ou `all`.
+            flow_method: `farneback` | `dis` | `identity` (ver `src/data/optical_flow.py`).
+            flow_preprocess: preset do pré-processamento dos métodos clássicos.
+            warp_convention: `dtc_trus` | `backward`.
+            noc_alpha: alpha do M_noc; None usa o equivalente do DTC-TRUS (~13.27).
+            farneback_params / farneback_median_ksize: parâmetros do Farneback (padrão do DTC-TRUS).
+        '''
+        super().__init__(**kwargs)
+        from .optical_flow import DEFAULT_NOC_ALPHA, FLOW_METHODS, WARP_CONVENTIONS
+
+        if self.window_size != 1:
+            raise ValueError("VFSSTemporalNeighborsDataset espera window_size=1: os vizinhos vêm de `neighbor_offsets`.")
+        offsets = [int(o) for o in (neighbor_offsets or [])]
+        if any(o == 0 for o in offsets):
+            raise ValueError("neighbor_offsets não pode conter 0 (o próprio central).")
+        if len(set(offsets)) != len(offsets):
+            raise ValueError(f"neighbor_offsets tem repetidos: {offsets}")
+        if int(neighbor_gap) < 1:
+            raise ValueError(f"neighbor_gap deve ser >= 1, recebeu {neighbor_gap}")
+        if neighbors_for not in NEIGHBORS_FOR:
+            raise ValueError(f"neighbors_for deve ser um de {NEIGHBORS_FOR}, recebeu '{neighbors_for}'")
+        if flow_method not in FLOW_METHODS:
+            raise ValueError(f"flow_method deve ser um de {FLOW_METHODS}, recebeu '{flow_method}'")
+        if warp_convention not in WARP_CONVENTIONS:
+            raise ValueError(f"warp_convention deve ser uma de {WARP_CONVENTIONS}, recebeu '{warp_convention}'")
+
+        self.neighbor_offsets = offsets
+        self.neighbor_gap = int(neighbor_gap)
+        self.neighbors_for = neighbors_for
+        self.flow_method = flow_method
+        self.flow_preprocess = flow_preprocess
+        self.warp_convention = warp_convention
+        self.noc_alpha = float(DEFAULT_NOC_ALPHA if noc_alpha is None else noc_alpha)
+        self.farneback_params = dict(farneback_params or {})
+        self.farneback_median_ksize = int(farneback_median_ksize)
+
+    # ------------------------------------------------------------------ helpers
+
+    def neighbor_frame_ids(self, frame_id: int) -> list:
+        return [int(frame_id) + o * self.neighbor_gap for o in self.neighbor_offsets]
+
+    def _frame_path(self, row: pd.Series, frame_id: int) -> Path:
+        '''Caminho absoluto do frame `frame_id` do vídeo de `row`, sem consultar o DataFrame.'''
+        return self.dataset_path / os.path.dirname(row.image_path) / f"{int(frame_id)}.png"
+
+    def _photo_image(self, path: Path) -> torch.Tensor:
+        '''Imagem [H,W] em [0,1] para fluxo e M_noc: `pixel/255`, sem min-max (`photo_norm=raw` do notebook).'''
+        image = T.PILToTensor()(Image.open(path).convert("L")).float() / 255.0
+        return self.image_transform(image).clamp(0.0, 1.0)[0]
+
+    def _model_image(self, path: Path) -> torch.Tensor:
+        image = T.PILToTensor()(Image.open(path).convert("L"))
+        if self.repeat_channels:
+            image = image.repeat(3, 1, 1)
+        return self._preprocess_image(image)
+
+    # ------------------------------------------------------------------ item
+
+    def __getitem__(self, idx=None, video_id=None, frame_id=None, video_frame=None):
+        sample = super().__getitem__(idx=idx, video_id=video_id, frame_id=frame_id, video_frame=video_frame)
+        n_neighbors = len(self.neighbor_offsets)
+        if n_neighbors == 0:
+            return sample
+
+        from .optical_flow import flow_and_confidence
+
+        image = sample["image"]
+        height, width = image.shape[-2:]
+        neighbors = torch.zeros((n_neighbors, *image.shape), dtype=image.dtype)
+        flows = torch.zeros((n_neighbors, 2, height, width), dtype=torch.float32)
+        confidence = torch.zeros((n_neighbors, 1, height, width), dtype=torch.float32)
+        valid = torch.zeros(n_neighbors, dtype=torch.bool)
+        frame_ids = [-1] * n_neighbors
+
+        metadata = sample["metadata"]
+        wants_neighbors = self.neighbors_for == "all" or not metadata["is_labeled"]
+        if wants_neighbors:
+            # `iloc`, not `_lookup_row`: the index is reset after the split filter, and a boolean scan
+            # of a ~40k-row pool per sample is what this path must not pay twice.
+            row = (self.video_frame_df.iloc[int(idx)] if idx is not None else
+                   self._lookup_row(video_id=video_id, frame_id=frame_id, video_frame=video_frame))
+            center_photo = None
+            for k, neighbor_id in enumerate(self.neighbor_frame_ids(int(row.frame_id))):
+                path = self._frame_path(row, neighbor_id)
+                if neighbor_id < 1 or not path.exists():
+                    continue
+                if center_photo is None:
+                    center_photo = self._photo_image(self._frame_path(row, int(row.frame_id))).numpy()
+                neighbors[k] = self._model_image(path)
+                flow, conf = flow_and_confidence(
+                    center_photo, self._photo_image(path).numpy(),
+                    convention=self.warp_convention, alpha=self.noc_alpha,
+                    method=self.flow_method, preprocess=self.flow_preprocess,
+                    farneback_params=self.farneback_params, median_ksize=self.farneback_median_ksize,
+                )
+                flows[k], confidence[k], valid[k] = flow, conf, True
+                frame_ids[k] = int(neighbor_id)
+
+        sample["neighbors"] = neighbors
+        sample["neighbor_flow"] = flows
+        sample["neighbor_confidence"] = confidence
+        sample["neighbor_valid"] = valid
+        metadata["neighbor_frame_ids"] = frame_ids
+        return sample
+
+
+class VFSSIncaTemporalTrain(VFSSTemporalNeighborsDataset):
+    def __init__(self, **kwargs):
+        super().__init__(split='train', **kwargs)
 
 
 class VFSSIncaTrain(VFSSWindowImageDataset):

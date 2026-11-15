@@ -1,0 +1,72 @@
+# E2 -- semi-supervisao com consistencia temporal sobre a arquitetura vencedora do E1.
+#
+#   python scripts/run_sweep.py --config configs/sweep/e2.yaml --dry-run
+#   scripts/submit.sh configs/sweep/e2.yaml
+#   # outra arquitetura sem editar este arquivo:
+#   python scripts/run_sweep.py --config configs/sweep/e2.yaml --set "axes.arch=[fpn]"
+#
+# Etapa anterior: configs/sweep/e2-cv.yaml (CV 5-fold, media ± desvio entre folds).
+#
+# Celula = (seed, arch, unlabeled_policy, method). Cada celula: treino final nos 80 pacientes de
+# desenvolvimento, checkpoint pela validacao fixa, avaliacao no teste INCA e no UNM (src/sweeps/e2.py).
+# Saidas: logs/e2/results_per_sample.csv (eval_set in {inca_test, unm}), logs/e2/results_resources.csv
+# (custo por run) e, pelo notebook, logs/e2/comparison_table.{csv,md}.
+type: sweep
+name: e2
+family: e2
+plan: src.sweeps.e2.E2Sweep
+
+# `method` mais interno: se a grade for cortada, os metodos concluidos seguem pareados por seed/politica.
+axes:
+  seed: [42]
+  arch: [deeplabv3plus]           # vencedora do E1; qualquer chave de `arch_configs`
+  unlabeled_policy: [global]      # [global, same_video] para comparar as duas origens
+  method: [supervised, fixmatch, meanteacher, mt-temporal-prev, mt-temporal-bi, mt-temporal-prev3]
+
+base_configs:
+  supervised:       configs/experiment/e2/e2-supervised.yaml
+  fixmatch:         configs/experiment/e2/e2-fixmatch.yaml
+  meanteacher:      configs/experiment/e2/e2-meanteacher.yaml
+  mt-temporal-prev: configs/experiment/e2/e2-mt-temporal-prev.yaml
+  mt-temporal-bi:   configs/experiment/e2/e2-mt-temporal-bi.yaml
+  mt-temporal-prev3: configs/experiment/e2/e2-mt-temporal-prev3.yaml   # T=3 (vizinho t-3)
+
+# De onde vem o bloco `model` de cada arquitetura (o mesmo do E1).
+arch_configs:
+  unet:          configs/experiment/e1/e1-unet.yaml
+  unetplusplus:  configs/experiment/e1/e1-unetplusplus.yaml
+  fpn:           configs/experiment/e1/e1-fpn.yaml
+  deeplabv3plus: configs/experiment/e1/e1-deeplabv3plus.yaml
+  swinunet_tiny: configs/experiment/e1/e1-swinunet-tiny.yaml
+
+# lr/wd congelados pelo tuning do E1.
+hparams_file: configs/frozen/e1-hparams.yaml
+
+training:
+  max_steps: 8000
+  val_every_n_steps: 500
+  labeled_batch_size: 8      
+  unlabeled_batch_size: 8
+  batch_size: 16              
+
+data:
+  split_file: configs/splits/inca-protocolo-s42.csv
+
+evaluation:
+  num_classes: 2
+  class_ids: {1: FG}
+  unm:
+    target: src.data.unm.VFSSUnmWindowImageDataset
+    params:
+      dataset_path: /data_ssd/caioseda/data/dataset_unm/
+      target_variant: binary_all
+      size: 256
+      window_size: 1
+      stride: 1
+      repeat_channels: True
+      mask_interpolation: nearest
+      split: null             # o UNM inteiro: nenhum frame dele foi visto no treino
+  num_workers: 8
+
+results_csv: results_per_sample.csv
+resources_csv: results_resources.csv

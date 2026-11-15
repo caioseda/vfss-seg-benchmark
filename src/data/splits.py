@@ -193,6 +193,7 @@ def assign_protocol_split(
     cv_fold: Optional[int] = None,
     group_column: str = "paciente_id",
     split_column: str = "split",
+    holdout_test: bool = False,
 ) -> pd.DataFrame:
     '''
     Write the per-run `split` column of the frame table from the protocol table.
@@ -200,7 +201,12 @@ def assign_protocol_split(
         train <- dev patients whose fold is in `train_folds` (default: every fold except `cv_fold`)
         val   <- the fixed validation partition
         test  <- dev patients of `cv_fold`; nobody when `cv_fold` is None
-        NaN   <- everyone else, the whole INCA test partition included
+                 -- or, with `holdout_test=True`, the INCA test partition
+        NaN   <- everyone else (the INCA test partition, unless `holdout_test`)
+
+    `holdout_test` is the ONLY way to reach the INCA test partition, and it is mutually exclusive with
+    `cv_fold`: a final-training run (E2) trains on every dev fold, selects on the fixed validation,
+    and is evaluated once on the held-out patients. Tuning and CV never pass it.
 
     NaN is the same mechanism `split_mode: legado` already relies on for its unassigned frames:
     those rows match no split, and the label regime and the unlabeled pool only look at 'train'.
@@ -219,6 +225,11 @@ def assign_protocol_split(
             f"{sorted(in_table - in_frames)[:10]}. The frame table changed after the split was generated."
         )
 
+    if holdout_test and cv_fold is not None:
+        raise ValueError(
+            "holdout_test=True and cv_fold are mutually exclusive: the 'test' split is either the "
+            "held-out CV fold or the INCA test partition, never both."
+        )
     folds = sorted(int(f) for f in table.fold.dropna().unique())
     if cv_fold is not None and int(cv_fold) not in folds:
         raise ValueError(f"cv_fold={cv_fold} is not a fold of this split ({folds}).")
@@ -240,6 +251,8 @@ def assign_protocol_split(
         elif row.partition == "dev" and int(row.fold) in train_folds:
             split_of[row.paciente_id] = "train"
         elif row.partition == "dev" and cv_fold is not None and int(row.fold) == int(cv_fold):
+            split_of[row.paciente_id] = "test"
+        elif row.partition == "test" and holdout_test:
             split_of[row.paciente_id] = "test"
 
     df = df.copy()

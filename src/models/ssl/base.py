@@ -22,6 +22,7 @@ term -- which is what makes the X1 comparison a clean read on supervision.
 '''
 
 import math
+from collections import Counter
 
 import torch
 from torch import Tensor
@@ -133,6 +134,7 @@ class SemiSupervisedLitWrapper(LitWrapper):
         self._total_steps_cache: Optional[int] = None
         self.log_pseudo_label_quality = log_pseudo_label_quality
         self.dice_loss = DiceLoss(self.n_classes)
+        self.forward_counts: Counter = Counter()
 
     # ------------------------------------------------------------------ schedule
 
@@ -314,6 +316,20 @@ class SemiSupervisedLitWrapper(LitWrapper):
 
         self.log_dict(logs, prog_bar=False, logger=True, on_step=False, on_epoch=True)
 
+    # ------------------------------------------------------------------ cost accounting
+
+    def count_forward(self, network: str, n_images: int) -> None:
+        '''
+        Record that `network` ("student", "student_nograd", "teacher", ...) processed `n_images` in this
+        training step. Read by `src.callbacks.ResourceMonitor` to report images per step per network,
+        which is what explains the wall-clock differences between methods (the temporal variants run
+        the teacher on 2-3x the unlabeled rows). Pure bookkeeping: never touches the loss.
+        '''
+        self.forward_counts[network] += int(n_images)
+
+    def on_train_batch_start(self, batch, batch_idx):
+        self.forward_counts = Counter()
+
     # ------------------------------------------------------------------ training
 
     def log_training(
@@ -366,6 +382,7 @@ class SemiSupervisedLitWrapper(LitWrapper):
         is_labeled = self.labeled_mask(batch).to(images.device)
 
         logits = self.forward(images)
+        self.count_forward("student", images.shape[0])
 
         if is_labeled.any():
             sup_loss = self.supervised_loss(logits[is_labeled], targets[is_labeled])

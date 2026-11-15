@@ -55,9 +55,11 @@ class FixMatchLitWrapper(SemiSupervisedLitWrapper):
         with torch.no_grad():
             weak_probs = torch.softmax(self.forward(weak_images), dim=1)
             max_probs, pseudo_labels = weak_probs.max(dim=1)
+        self.count_forward("student_nograd", weak_images.shape[0])
 
         strong_images, valid = strong_augment(weak_images, cutout_prob=self.cutout_prob)
         strong_logits = self.forward(strong_images)
+        self.count_forward("student", strong_images.shape[0])
 
         keep = (max_probs >= self.confidence_threshold) & valid
         self.log("train/pseudo_label_coverage", keep.float().mean(),

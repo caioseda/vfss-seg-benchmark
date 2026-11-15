@@ -205,3 +205,100 @@ def paired_fold_differences(per_fold: pd.DataFrame, by: str, reference,
         merged[metric] = merged[metric] - merged[f"{metric}_reference"]
     merged["reference"] = reference
     return merged[[by, "reference"] + keys + list(metrics)]
+
+
+# ---------------------------------------------------------------------- comparison table (E2)
+
+# (coluna em `resources`, rótulo na tabela, fator de escala). A ordem é a ordem das colunas.
+RESOURCE_COLUMNS = (
+    ("fit_wall_s", "tempo total (h)", 1 / 3600),
+    ("s_per_step_mean", "s/passo", 1.0),
+    ("data_wait_frac", "espera por dados (%)", 100.0),
+    ("vram_train_peak_gb", "VRAM treino (GB)", 1.0),
+    ("vram_test_peak_gb", "VRAM inferência (GB)", 1.0),
+    ("params_total_m", "params student (M)", 1.0),
+    ("teacher_params_m", "params teacher (M)", 1.0),
+    ("params_trainable_m", "params treináveis (M)", 1.0),
+    ("gflops_per_frame", "GFLOPs/frame", 1.0),
+    ("latency_ms_per_frame_bs1", "latência bs1 (ms/frame)", 1.0),
+    ("latency_ms_per_frame_bs8", "latência bs8 (ms/frame)", 1.0),
+    ("images_per_step_student", "imagens/passo student", 1.0),
+    ("images_per_step_teacher", "imagens/passo teacher", 1.0),
+    ("checkpoint_mb", "checkpoint (MB)", 1.0),
+    ("best_step", "passo do melhor ckpt", 1.0),
+)
+
+
+def comparison_table(per_sample: pd.DataFrame, resources: Optional[pd.DataFrame] = None,
+                     by: Sequence[str] = ("method",), reference: Optional[str] = "supervised",
+                     seed_column: str = "seed", eval_column: str = "eval_set",
+                     patient_column: str = "paciente_id",
+                     metrics: Sequence[str] = METRIC_NAMES) -> pd.DataFrame:
+    '''
+    Uma linha por combinação de `by` (ex.: método x política de não rotulados): acurácia por
+    `eval_set` e custo, lado a lado.
+
+    Acurácia, na agregação do protocolo (frames -> paciente -> média dos pacientes; classes em média
+    dentro do paciente):
+      - `<eval_set> <métrica>`: média; `± <métrica>`: desvio entre seeds quando há mais de uma, senão
+        o desvio entre pacientes (dito na coluna `± entre`);
+      - `<eval_set> Δdice vs <reference>`: diferença PAREADA por paciente (mesma seed) contra o método
+        de referência, média sobre pacientes e seeds.
+    Custo: as colunas de `RESOURCE_COLUMNS` encontradas em `resources` (uma linha por run, com as
+    colunas de `by` e `seed_column`), média entre seeds.
+    '''
+    by = list(by)
+    run_keys = by + ([seed_column] if seed_column in per_sample.columns else [])
+    patient = aggregate_per_class(per_sample, group_columns=run_keys + [eval_column, patient_column])
+    patient = patient.groupby(run_keys + [eval_column, patient_column], dropna=False)[list(metrics)].mean().reset_index()
+
+    per_run = patient.groupby(run_keys + [eval_column], dropna=False)[list(metrics)].agg(["mean", "std"])
+    per_run.columns = [f"{m}_{s}" for m, s in per_run.columns]
+    per_run = per_run.reset_index()
+
+    seeds = per_sample[seed_column].nunique() if seed_column in per_sample.columns else 1
+    rows = {}
+    for keys, group in per_run.groupby(by + [eval_column], dropna=False):
+        keys = keys if isinstance(keys, tuple) else (keys,)
+        key, eval_set = keys[:-1], keys[-1]
+        row = rows.setdefault(key, {})
+        for metric in metrics:
+            row[f"{eval_set} {metric}"] = group[f"{metric}_mean"].mean()
+            row[f"{eval_set} ± {metric}"] = (group[f"{metric}_mean"].std(ddof=1) if seeds > 1
+                                             else group[f"{metric}_std"].mean())
+
+    if reference is not None and by and reference in set(patient[by[0]]):
+        pair_keys = [k for k in run_keys if k != by[0]] + [eval_column, patient_column]
+        reference_rows = patient[patient[by[0]] == reference][pair_keys + ["dice"]]
+        merged = patient.merge(reference_rows, on=pair_keys, suffixes=("", "_ref"), how="inner")
+        merged["delta"] = merged["dice"] - merged["dice_ref"]
+        for keys, group in merged.groupby(by + [eval_column], dropna=False):
+            keys = keys if isinstance(keys, tuple) else (keys,)
+            rows.setdefault(keys[:-1], {})[f"{keys[-1]} Δdice vs {reference}"] = group["delta"].mean()
+
+    table = pd.DataFrame([dict(zip(by, key), **values) for key, values in rows.items()])
+    table["± entre"] = "seeds" if seeds > 1 else "pacientes"
+
+    if resources is not None and not resources.empty:
+        available = [(col, label, scale) for col, label, scale in RESOURCE_COLUMNS if col in resources.columns]
+        cost = resources.copy()
+        for col, _, _ in available:
+            cost[col] = pd.to_numeric(cost[col], errors="coerce")
+        cost = cost.groupby(by, dropna=False)[[col for col, _, _ in available]].mean().reset_index()
+        for col, label, scale in available:
+            cost[label] = cost.pop(col) * scale
+        table = table.merge(cost, on=by, how="left")
+    return table
+
+
+def table_to_markdown(table: pd.DataFrame, floatfmt: str = "{:.3f}") -> str:
+    '''Markdown simples (sem dependência de `tabulate`), pronto para colar na dissertação.'''
+    def fmt(value) -> str:
+        if isinstance(value, float):
+            return "" if value != value else floatfmt.format(value)
+        return str(value)
+
+    header = "| " + " | ".join(map(str, table.columns)) + " |"
+    rule = "|" + "|".join("---" for _ in table.columns) + "|"
+    body = ["| " + " | ".join(fmt(v) for v in row) + " |" for row in table.itertuples(index=False)]
+    return "\n".join([header, rule, *body])

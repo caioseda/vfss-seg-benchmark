@@ -1,0 +1,62 @@
+# E2 / CV -- CV 5-fold por paciente dos cinco metodos do E2, com os hiperparametros congelados do E1.
+# Etapa ANTERIOR ao treino final (configs/sweep/e2.yaml), no molde do e1-cv.yaml.
+#
+#   python scripts/run_sweep.py --config configs/sweep/e2-cv.yaml --dry-run
+#   scripts/submit.sh configs/sweep/e2-cv.yaml
+#
+# Rodada k: treina nos folds != k (rotulos + frames nunca anotados SO desses videos), escolhe o checkpoint
+# pela validacao fixa e avalia no fold k (o split 'test' do run; eval_set=cv). O teste INCA e o UNM NAO
+# sao carregados -- eles ficam para o treino final do e2.yaml. Logica: src/sweeps/e2.py (E2CVSweep).
+# Agregacao frames -> paciente -> fold, media ± desvio entre folds e diferencas pareadas por fold:
+# notebooks/artigo/e2_ssl_temporal/e2_02_cv.ipynb.
+#
+# Custo: 5 folds x 6 metodos = 30 runs de 8000 passos por (arch, politica, seed).
+type: sweep
+name: e2-cv
+family: e2-cv
+plan: src.sweeps.e2.E2CVSweep
+
+# `method` mais interno, `fold` logo acima: se a grade for cortada, os folds concluidos tem todos os
+# metodos, pareados pelo mesmo fold/seed/politica. `mt-temporal-prev3` vai por ultimo (comparacao de T).
+axes:
+  seed: [42]
+  arch: [deeplabv3plus]           # vencedora do E1; qualquer chave de `arch_configs`
+  unlabeled_policy: [global]      # [global, same_video] para comparar as duas origens
+  fold: [0, 1, 2, 3, 4]
+  method: [supervised, fixmatch, meanteacher, mt-temporal-prev, mt-temporal-bi, mt-temporal-prev3]
+
+# Os mesmos YAMLs do treino final: o sweep troca `holdout_test` por `cv_fold`.
+base_configs:
+  supervised:       configs/experiment/e2/e2-supervised.yaml
+  fixmatch:         configs/experiment/e2/e2-fixmatch.yaml
+  meanteacher:      configs/experiment/e2/e2-meanteacher.yaml
+  mt-temporal-prev: configs/experiment/e2/e2-mt-temporal-prev.yaml
+  mt-temporal-bi:   configs/experiment/e2/e2-mt-temporal-bi.yaml
+  mt-temporal-prev3: configs/experiment/e2/e2-mt-temporal-prev3.yaml   # T=3 (vizinho t-3)
+
+arch_configs:
+  unet:          configs/experiment/e1/e1-unet.yaml
+  unetplusplus:  configs/experiment/e1/e1-unetplusplus.yaml
+  fpn:           configs/experiment/e1/e1-fpn.yaml
+  deeplabv3plus: configs/experiment/e1/e1-deeplabv3plus.yaml
+  swinunet_tiny: configs/experiment/e1/e1-swinunet-tiny.yaml
+
+hparams_file: configs/frozen/e1-hparams.yaml
+
+training:
+  max_steps: 8000
+  val_every_n_steps: 500
+  labeled_batch_size: 8
+  unlabeled_batch_size: 8
+  batch_size: 16
+
+data:
+  split_file: configs/splits/inca-protocolo-s42.csv
+
+evaluation:
+  num_classes: 2
+  class_ids: {1: FG}
+  num_workers: 8
+
+results_csv: results_per_sample.csv
+resources_csv: results_resources.csv

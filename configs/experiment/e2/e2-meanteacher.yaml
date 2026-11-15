@@ -1,0 +1,127 @@
+# E2 -- Mean Teacher (consistencia EMA nos nao rotulados)
+#
+# Gerado a partir de um molde comum: os cinco configs de configs/experiment/e2/ sao identicos fora de
+# `lit_module` e do dataset de treino. Rodado sozinho, este YAML treina a DeepLabV3+ (vencedora do E1) com
+# lr/wd de referencia; o sweep (configs/sweep/e2.yaml, src/sweeps/e2.py) troca o bloco `model` pelo da
+# arquitetura escolhida e aplica lr/wd congelados em configs/frozen/e1-hparams.yaml.
+#
+# Regime: treino FINAL -- todos os 5 folds do desenvolvimento em 'train' (todos os rotulos) + pool de frames
+# nunca anotados desses videos, checkpoint pela validacao fixa (val/dice_patient), avaliacao unica no TESTE
+# INCA (`holdout_test: true`) e, pelo sweep, no UNM inteiro.
+#
+# Lote: 8 rotulados (= batch do e1-cv) + 8 nao rotulados, para TODOS os metodos -- o supervisionado ve os
+# mesmos lotes e so nao tem perda nos nao rotulados, como no X1. Cada indice do lote e um frame central.
+name: e2-meanteacher
+type: experiment
+
+model:
+  target: src.models.smp.adapters.SMPModel
+  params:
+    arch: DeepLabV3Plus
+    encoder_name: resnet34
+    encoder_weights: imagenet
+    input_normalization: imagenet
+    n_channels: 3
+    n_classes: 2
+
+lit_module:
+  target: src.models.ssl.mean_teacher.MeanTeacherLitWrapper
+  params:
+    report_class_ids: {1: FG}
+    surface_metric_stages: [test]
+    ema_decay: 0.99
+    noise_std: 0.1
+    noise_clamp: 0.2
+    evaluate_with_teacher: True          # val/teste pelo teacher EMA
+    consistency_weight: 0.1
+    # Cronograma ancorado no ORCAMENTO (ver src/models/ssl/base.py): mesmos valores do X1.
+    consistency_rampup_fraction: 1.0
+    consistency_warmup_fraction: 0.0333
+    log_pseudo_label_quality: True       # no-op sem rotulos escondidos (label_fraction=1.0)
+
+optimizer:
+  target: torch.optim.AdamW
+  params:
+    lr: 0.0002987741102824           # DeepLabV3+ congelada no E1; o sweep reescreve por arquitetura
+    weight_decay: 3.681754774371584e-06
+
+lr_scheduler:
+  target: torch.optim.lr_scheduler.CosineAnnealingLR
+  params:
+    T_max: 8000
+    eta_min: 1e-6
+  interval: step
+
+trainer:
+  params:
+    max_steps: 8000
+    max_epochs: -1
+    accelerator: auto
+    devices: auto
+    val_check_interval: 500
+    check_val_every_n_epoch: null
+    accumulate_grad_batches: 1
+  checkpoint:
+    monitor: val/dice_patient
+    mode: max
+    save_top_k: 1
+    filename: 'best-{epoch}-{step}'
+  callbacks:
+    - target: src.callbacks.PrintDeviceCallback
+    - target: src.callbacks.PatientValidation
+      params:
+        num_classes: 2
+        class_ids: {1: FG}
+    # Tempo, VRAM, tamanho do modelo e carga por passo -> run.json (`resources`) e a tabela comparativa.
+    - target: src.callbacks.ResourceMonitor
+      params:
+        input_size: 256
+
+data:
+  target: src.data.base.DataModuleFromConfig
+  params:
+    batch_size: 16          # val/teste; o treino usa o TwoStreamBatchSampler abaixo
+    num_workers: 16         # o pool nao cabe em cache; os workers decodificam e calculam o fluxo (~0.15 s/amostra temporal)
+    persistent_train_workers: True
+    cache_splits: [validation, test]
+    cache_num_workers: 8
+    wrap: False
+    train_batch_sampler:
+      target: src.data.samplers.TwoStreamBatchSampler
+      params:
+        labeled_batch_size: 8
+        unlabeled_batch_size: 8
+        seed: 42
+        # `global`: qualquer frame nunca anotado de qualquer video de treino, em qualquer posicao.
+        # `same_video` (X1) e o outro valor do eixo `unlabeled_policy` do sweep.
+        unlabeled_policy: global
+    shared_dataset_params:
+      dataset_path: /data_ssd/caioseda/data/dataset_inca_all_frames/
+      size: 256
+      window_size: 1
+      stride: 1
+      repeat_channels: True
+      mask_interpolation: nearest
+      target_variant: 'binary_all'
+      split_mode: protocol
+      split_file: configs/splits/inca-protocolo-s42.csv
+      split_group_column: paciente_id
+      train_folds: null       # todos os folds do desenvolvimento
+      cv_fold: null
+      holdout_test: true      # 'test' = teste INCA (23 pacientes). Treino final.
+      label_fraction: 1.0
+      label_seed: 42
+      label_group_column: paciente_id
+    train:
+      target: src.data.vfss_frame_dataset.VFSSIncaTrain
+      params:
+        # Pool REAL de nao rotulados: todo frame nunca anotado dos videos de treino, sem teto.
+        use_unlabeled_pool: true
+        unlabeled_pool_size: null
+        unlabeled_pool_frame_stride: 1
+        unlabeled_pool_seed: 42
+        unlabeled_pool_splits: [train]
+    validation:
+      target: src.data.vfss_frame_dataset.VFSSIncaVal
+    test:
+      target: src.data.vfss_frame_dataset.VFSSIncaTest
