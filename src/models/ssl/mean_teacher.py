@@ -19,54 +19,129 @@ in torch 2.x.
 '''
 
 import copy
+from collections import deque
 
 import torch
-from torch import Tensor
+from torch import Tensor, nn
 
 from .base import SemiSupervisedLitWrapper
 from ...data.augmentations import gaussian_noise
 
-from typing import Dict
+from typing import Dict, Iterable
+
+
+BN_BUFFER_MODES = ("copy", "ema", "recalibrate")
+
+
+@torch.no_grad()
+def recalibrate_batchnorm(network: nn.Module, batches: Iterable[Tensor]) -> int:
+    '''
+    Re-estimate every BatchNorm's running mean/var of `network` **in place** from `batches`.
+
+    Running stats are reset and the momentum set to None (cumulative average, so every batch weighs
+    the same), the network is run in train mode without gradients, and then everything -- momentum
+    and train/eval mode -- is restored. Parameters are never touched: only the buffers change.
+
+    Returns the number of batches used (0 leaves the network as it was, stats included).
+    '''
+    batches = list(batches)
+    bn_layers = [m for m in network.modules() if isinstance(m, nn.modules.batchnorm._BatchNorm)]
+    if not batches or not bn_layers:
+        return 0
+    was_training = network.training
+    momenta = [m.momentum for m in bn_layers]
+    for m in bn_layers:
+        m.reset_running_stats()
+        m.momentum = None
+    network.train()
+    device = next(network.parameters()).device
+    for images in batches:
+        network(images.to(device))
+    for m, momentum in zip(bn_layers, momenta):
+        m.momentum = momentum
+    network.train(was_training)
+    return len(batches)
 
 
 class MeanTeacherLitWrapper(SemiSupervisedLitWrapper):
 
     def __init__(self, *args, ema_decay: float = 0.99,
                  noise_std: float = 0.1, noise_clamp: float = 0.2,
-                 evaluate_with_teacher: bool = True, **kwargs):
+                 evaluate_with_teacher: bool = True,
+                 bn_buffer_mode: str = "copy",
+                 bn_recalibration_batches: int = 32,
+                 **kwargs):
         '''
         Args:
             ema_decay: teacher EMA decay (SSL4MIS `--ema_decay`, default 0.99).
             noise_std / noise_clamp: teacher input perturbation.
             evaluate_with_teacher: run val/test through the teacher, which is the usual Mean Teacher
                 reporting convention (the EMA weights are the better model).
+            bn_buffer_mode: how the teacher's BatchNorm running stats are produced.
+                `copy` (default, SSL4MIS): copied from the student every step -- so in eval mode the
+                teacher combines AVERAGED weights with the student's CURRENT statistics.
+                `ema`: averaged with the same alpha as the weights (timm `ModelEmaV2`), so weights and
+                statistics come from the same average.
+                `recalibrate`: copied as in `copy` during training, and re-estimated from the last
+                `bn_recalibration_batches` training batches right before every validation/test.
+            bn_recalibration_batches: size of the ring buffer of recent training batches used by
+                `recalibrate` (images only, kept on CPU).
         '''
+        if bn_buffer_mode not in BN_BUFFER_MODES:
+            raise ValueError(f"bn_buffer_mode deve ser um de {BN_BUFFER_MODES}, recebeu '{bn_buffer_mode}'")
         super().__init__(*args, **kwargs)
         self.save_hyperparameters({
             "ema_decay": ema_decay,
             "noise_std": noise_std,
             "noise_clamp": noise_clamp,
             "evaluate_with_teacher": evaluate_with_teacher,
+            "bn_buffer_mode": bn_buffer_mode,
+            "bn_recalibration_batches": bn_recalibration_batches,
         })
         self.ema_decay = ema_decay
         self.noise_std = noise_std
         self.noise_clamp = noise_clamp
         self.evaluate_with_teacher = evaluate_with_teacher
+        self.bn_buffer_mode = bn_buffer_mode
+        self.recent_train_images: deque = deque(maxlen=max(int(bn_recalibration_batches), 1))
 
         self.teacher = copy.deepcopy(self.model)
         for param in self.teacher.parameters():
             param.detach_()
             param.requires_grad_(False)
 
+    def ema_alpha(self) -> float:
+        return min(1.0 - 1.0 / (self.global_step + 1), self.ema_decay)
+
     @torch.no_grad()
     def update_teacher(self) -> None:
         '''EMA update, rewritten for the torch 2.x `add_(tensor, alpha=...)` signature.'''
-        alpha = min(1.0 - 1.0 / (self.global_step + 1), self.ema_decay)
+        alpha = self.ema_alpha()
         for teacher_param, student_param in zip(self.teacher.parameters(), self.model.parameters()):
             teacher_param.data.mul_(alpha).add_(student_param.data, alpha=1.0 - alpha)
-        # Buffers (BatchNorm running stats) are copied, not averaged -- as in the reference.
         for teacher_buffer, student_buffer in zip(self.teacher.buffers(), self.model.buffers()):
-            teacher_buffer.data.copy_(student_buffer.data)
+            if self.bn_buffer_mode == "ema" and teacher_buffer.is_floating_point():
+                teacher_buffer.data.mul_(alpha).add_(student_buffer.data, alpha=1.0 - alpha)
+            else:
+                # `copy`/`recalibrate`, and integer buffers (`num_batches_tracked`) in every mode:
+                # copied, not averaged -- as in the reference.
+                teacher_buffer.data.copy_(student_buffer.data)
+
+    def recalibrate_teacher_bn(self) -> int:
+        '''Re-estimate the teacher's BN statistics from the buffered recent training batches.'''
+        return recalibrate_batchnorm(self.teacher, self.recent_train_images)
+
+    def _maybe_recalibrate(self) -> None:
+        if self.bn_buffer_mode == "recalibrate" and self.evaluate_with_teacher:
+            self.recalibrate_teacher_bn()
+            # Leave the teacher in eval mode for the evaluation loop that follows.
+            self.teacher.eval()
+
+    def on_validation_epoch_start(self):
+        self._maybe_recalibrate()
+
+    def on_test_epoch_start(self):
+        self._maybe_recalibrate()
 
     def unsupervised_loss(self, batch: Dict, logits: Tensor, is_labeled: Tensor) -> Tensor:
         unlabeled = ~is_labeled
@@ -88,6 +163,8 @@ class MeanTeacherLitWrapper(SemiSupervisedLitWrapper):
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
         self.update_teacher()
+        if self.bn_buffer_mode == "recalibrate":
+            self.recent_train_images.append(batch["image"].detach().cpu())
 
     def forward(self, x):
         '''Student forward. Evaluation is routed through the teacher by the eval hooks below.'''

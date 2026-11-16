@@ -29,9 +29,10 @@ from torch import Tensor
 from torchmetrics.functional.segmentation import dice_score
 
 from ..base import LitWrapper
+from ...data.augmentations import weak_augment_multi
 from ...third_party.ssl4mis import DiceLoss
 
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 # --------------------------------------------------------------------------------------------
@@ -56,6 +57,8 @@ REFERENCE_WARMUP_STEPS = 1_000     # `if iter_num < 1000: consistency_loss = 0.0
 
 DEFAULT_RAMPUP_FRACTION = REFERENCE_RAMPUP_STEPS / REFERENCE_TOTAL_STEPS   # 1.0
 DEFAULT_WARMUP_FRACTION = REFERENCE_WARMUP_STEPS / REFERENCE_TOTAL_STEPS   # 0.0333...
+
+STUDENT_AUGMENT_MODES = ("none", "weak")
 
 
 def sigmoid_rampup(current: float, rampup_length: float) -> float:
@@ -84,6 +87,15 @@ class SemiSupervisedLitWrapper(LitWrapper):
     identically for every method and every budget.
     '''
 
+    # Whether the shared `training_step` (which is where `student_augment` is applied) is the one
+    # this method trains with. Subclasses that override the step, or that already augment on their
+    # own (FixMatch), set it False so that the flag cannot be silently ignored.
+    supports_student_augment = True
+    # Which rows `student_augment` reaches: `all` (the shared step, and Mean Teacher, whose teacher then
+    # sees the same geometry) or `labeled` (FixMatch: its unlabeled rows already get their own
+    # weak/strong views, and augmenting them here would stack two weak draws).
+    student_augment_rows = "all"
+
     def __init__(
         self,
         model_cfg,
@@ -96,6 +108,7 @@ class SemiSupervisedLitWrapper(LitWrapper):
         consistency_warmup_steps: Optional[float] = None,
         total_steps: Optional[int] = None,
         log_pseudo_label_quality: bool = True,
+        student_augment: str = "none",
         **lit_wrapper_kwargs,
     ):
         '''
@@ -114,7 +127,22 @@ class SemiSupervisedLitWrapper(LitWrapper):
             log_pseudo_label_quality: log the quality of the unsupervised signal against the ground
                 truth that the label regime hid (never used by the loss -- see
                 `log_unlabeled_diagnostics`). Requires `expose_hidden_targets=True` on the dataset.
+            student_augment: `none` (default, the historical behaviour: no augmentation at all) or
+                `weak` -- `weak_augment_multi` (flip + small affine) applied before the student
+                forward to the rows picked by `student_augment_rows` (the whole batch, or only the
+                labeled rows for FixMatch), with the masks warped by the same draw. Because the batch
+                itself is replaced, every downstream consumer (the supervised term, and Mean
+                Teacher's teacher forward on the unlabeled rows) sees the same geometry, so student
+                and teacher outputs stay pixel-aligned with no inverse warp. The temporal MT also
+                carries the draw into the neighbours, the optical flow and M_noc.
         '''
+        if student_augment not in STUDENT_AUGMENT_MODES:
+            raise ValueError(f"student_augment deve ser um de {STUDENT_AUGMENT_MODES}, recebeu '{student_augment}'")
+        if student_augment != "none" and not self.supports_student_augment:
+            raise ValueError(
+                f"{type(self).__name__} nao aplica `student_augment` (o passo de treino e proprio ou o "
+                f"metodo ja tem augmentation); use student_augment='none'."
+            )
         super().__init__(model_cfg, optimizer_cfg, lr_scheduler_cfg, **lit_wrapper_kwargs)
         self.save_hyperparameters({
             "consistency_weight": consistency_weight,
@@ -124,7 +152,9 @@ class SemiSupervisedLitWrapper(LitWrapper):
             "consistency_warmup_steps": consistency_warmup_steps,
             "total_steps": total_steps,
             "log_pseudo_label_quality": log_pseudo_label_quality,
+            "student_augment": student_augment,
         })
+        self.student_augment = student_augment
         self.consistency_weight = consistency_weight
         self.consistency_rampup_fraction = consistency_rampup_fraction
         self.consistency_warmup_fraction = consistency_warmup_fraction
@@ -377,7 +407,52 @@ class SemiSupervisedLitWrapper(LitWrapper):
                  on_step=True, on_epoch=False)
         self.log_dict(log_dict, prog_bar=False, logger=True, on_step=False, on_epoch=True)
 
+    def augment_batch(self, batch: Dict) -> Dict:
+        '''
+        Apply `student_augment` to a training batch. Returns a shallow copy whose per-row tensors
+        (`image`, `segmentation`, `hidden_segmentation` and whatever `_weak_augment_rows` adds) are
+        replaced, on the rows chosen by `student_augment_rows`, by one shared geometric draw per row;
+        everything else (metadata, ...) is passed through untouched.
+        '''
+        if self.student_augment == "none":
+            return batch
+        images = batch["image"]
+        if self.student_augment_rows == "labeled":
+            rows = self.labeled_mask(batch).to(images.device)
+            if not rows.any():
+                return batch
+        else:
+            rows = None
+
+        def take(tensor):
+            return tensor if rows is None else tensor[rows]
+
+        subset = {key: take(batch[key]) for key in self._augmented_keys(batch)}
+        augmented_rows = self._weak_augment_rows(subset)
+
+        augmented = dict(batch)
+        for key, value in augmented_rows.items():
+            value = value.to(batch[key].dtype)
+            if rows is None:
+                augmented[key] = value
+            else:
+                full = batch[key].clone()
+                full[rows] = value
+                augmented[key] = full
+        return augmented
+
+    def _augmented_keys(self, batch: Dict) -> List[str]:
+        '''Per-row keys the geometry has to reach, so that nothing downstream sees a stale view.'''
+        return [key for key in ("image", "segmentation", "hidden_segmentation") if key in batch]
+
+    def _weak_augment_rows(self, rows: Dict[str, Tensor]) -> Dict[str, Tensor]:
+        '''One weak draw per row, applied to the image and to every mask of `rows`.'''
+        mask_keys = [key for key in ("segmentation", "hidden_segmentation") if key in rows]
+        image, masks = weak_augment_multi(rows["image"], [rows[key] for key in mask_keys])
+        return {"image": image, **dict(zip(mask_keys, masks))}
+
     def training_step(self, batch, batch_idx):
+        batch = self.augment_batch(batch)
         images, targets = batch["image"], batch["segmentation"]
         is_labeled = self.labeled_mask(batch).to(images.device)
 

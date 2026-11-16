@@ -49,3 +49,14 @@ class SMPModel(nn.Module):
 
     def forward(self, x):
         return self.model(self.input_normalization(x))
+
+    def forward_features(self, x):
+        '''
+        `(logits, local, global)` num único forward -- o que a perda de protótipos do DTC-TRUS pede:
+        `local` é o último mapa antes da cabeça de segmentação (saída do decoder: resolução cheia na
+        U-Net/U-Net++, 1/4 na DeepLabV3+/FPN) e `global` é o gargalo do encoder (`features[-1]`).
+        `logits` é idêntico a `forward(x)`.
+        '''
+        features = self.model.encoder(self.input_normalization(x))
+        decoder_output = self.model.decoder(features)
+        return self.model.segmentation_head(decoder_output), decoder_output, features[-1]

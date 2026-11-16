@@ -16,10 +16,18 @@ O que difere do E1 e não pode virar YAML estático:
 
 `E2CVSweep` é a etapa anterior, no molde do `E1CVSweep`: CV 5-fold por paciente no desenvolvimento,
 para estimar média ± desvio entre folds de cada método. O teste INCA e o UNM não são tocados.
+
+Métodos de duas etapas (DTC-TRUS): `teacher_from: {dtc-trus: supervised}` no YAML do sweep diz que a etapa
+1 do método é a célula `supervised` com as MESMAS demais coordenadas (seed, arch, política e, no CV, fold).
+O best.ckpt dela -- registrado pelo `Sweep` em `_sweep/state.json` -- vira `teacher_checkpoint`. Assim a
+diferença DTC - supervisionado é pareada pelo mesmo professor, e a etapa 1 não é re-treinada (nem re-sorteada
+pelo não-determinismo). A ordem da grade (`method` mais interno, `supervised` antes) garante que a irmã já
+rodou; se não rodou, `overrides` falha dizendo qual célula falta. O custo da etapa 1 é somado na CSV de custo.
 '''
+import json
 import time
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional, Tuple
 
 import pandas as pd
 import torch
@@ -75,7 +83,46 @@ class E2Sweep(E1CVSweep):
             "unlabeled_policy": str(cell["unlabeled_policy"]),
             "seed": int(cell["seed"]),
         }}
+        teacher = self.teacher_for(cell)
+        if teacher is not None:
+            teacher_run_id, checkpoint = teacher
+            overrides["lit_module"] = {"params": {"teacher_checkpoint": checkpoint,
+                                                  "teacher_run_id": teacher_run_id}}
         return overrides
+
+    # ------------------------------------------------------------------ two-stage methods
+
+    def _teacher_methods(self) -> Dict[str, str]:
+        return {str(k): str(v) for k, v in (self.config.get("teacher_from") or {}).items()}
+
+    def _sweep_state(self) -> Dict[str, Any]:
+        path = self.sweep_dir / "state.json"
+        try:
+            return json.loads(path.read_text())
+        except FileNotFoundError:
+            return {"cells": {}}
+
+    def teacher_for(self, cell: Dict[str, Any]) -> Optional[Tuple[str, str]]:
+        '''
+        `(run_id, best_checkpoint_path)` da célula que é a etapa 1 desta, ou None se o método tem uma etapa
+        só. A irmã é a mesma célula com `method` trocado -- então, no CV, o fold k só recebe o professor do
+        fold k (treinado sem o fold k).
+        '''
+        teacher_method = self._teacher_methods().get(str(cell["method"]))
+        if teacher_method is None:
+            return None
+        sibling = {**cell, "method": teacher_method}
+        run_id = self.run_id(sibling)
+        entry = self._sweep_state().get("cells", {}).get(run_id, {})
+        checkpoint = entry.get("best_checkpoint_path")
+        if entry.get("status") != "done" or not checkpoint or not Path(checkpoint).exists():
+            raise RuntimeError(
+                f"A etapa 1 de '{self.run_id(cell)}' é a célula '{run_id}', que ainda não está concluída "
+                f"com um best checkpoint em {self.sweep_dir / 'state.json'} (status="
+                f"{entry.get('status', 'ausente')}, checkpoint={checkpoint}). Rode-a antes -- ela vem antes "
+                f"na grade se `{teacher_method}` estiver em `axes.method`."
+            )
+        return run_id, str(checkpoint)
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -142,11 +189,28 @@ class E2Sweep(E1CVSweep):
                **(experiment.resources or {}), **getattr(self, "_eval_costs", {}),
                "output_dir": str(experiment.experiment_run_dir)}
         existing = self.load_resources()
+        row.update(self._stage1_costs(cell, existing))
+        row["total_fit_wall_s"] = float(row.get("fit_wall_s", float("nan"))) + float(row.get("stage1_fit_wall_s", 0.0))
+        row["total_train_s"] = float(row.get("train_s", float("nan"))) + float(row.get("stage1_train_s", 0.0))
         if len(existing) and "run_id" in existing.columns:
             existing = existing[existing.run_id != row["run_id"]]
         table = pd.concat([existing, pd.DataFrame([row])], ignore_index=True)
         self.resources_csv.parent.mkdir(parents=True, exist_ok=True)
         table.to_csv(self.resources_csv, index=False)
+
+    STAGE1_COST_KEYS = ("fit_wall_s", "train_s", "steps")
+
+    def _stage1_costs(self, cell: Dict[str, Any], resources: pd.DataFrame) -> Dict[str, Any]:
+        '''Custo da etapa 1 (a célula professora), lido da própria CSV de custo, como `stage1_*`.'''
+        teacher_method = self._teacher_methods().get(str(cell["method"]))
+        if teacher_method is None:
+            return {}
+        teacher_run_id = self.run_id({**cell, "method": teacher_method})
+        costs: Dict[str, Any] = {"teacher_run_id": teacher_run_id}
+        rows = resources[resources.run_id == teacher_run_id] if "run_id" in resources.columns else resources.iloc[:0]
+        for key in self.STAGE1_COST_KEYS:
+            costs[f"stage1_{key}"] = float(rows.iloc[-1][key]) if len(rows) and key in rows.columns else float("nan")
+        return costs
 
 
 class E2CVSweep(E2Sweep):

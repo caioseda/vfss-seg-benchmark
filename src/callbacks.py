@@ -299,6 +299,196 @@ class ResumeFidelity(Callback):
         self._pending_rng_states = None
 
 
+class MTEvalProbe(Callback):
+    '''
+    Diagnóstico do colapso da validação nos métodos com teacher EMA (Mean Teacher e variantes
+    temporais). Estritamente observacional: nunca altera pesos nem buffers do módulo -- as variantes
+    que mexem em BN trabalham numa cópia.
+
+    A cada validação loga, com prefixo `probe/`:
+
+      - `dice_teacher_eval`      teacher em eval mode (= o que `val/dice_patient` mede hoje);
+      - `dice_student_eval`      student em eval mode -- separa "os pesos pioraram" (H1/H3) de
+                                 "só a avaliação do teacher quebrou" (H2);
+      - `dice_teacher_bnrecal`   cópia do teacher com BN re-estimado em lotes recentes de treino;
+      - `dice_teacher_trainbn`   cópia do teacher com BN em train mode (estatísticas do lote de val);
+      - `fg_frac_*`              fração de pixels FG previstos na val (teacher/student) e no GT,
+                                 e nos não rotulados recentes (`fg_frac_unl_*`) -- colapso para
+                                 "tudo fundo" aparece aqui;
+      - `param_dist`             ||θ_teacher − θ_student|| / ||θ_student||;
+      - `bn_var_min/max`, `bn_nonfinite` (teacher e student) -- saúde dos running stats;
+      - `train_dice_eval_student/teacher`  Dice por frame num subconjunto FIXO de frames rotulados de
+                                 treino, em eval mode: o gap treino-val medido no mesmo modo da val.
+
+    Dice de val é o mesmo do protocolo (média por paciente, via `evaluate_per_class` +
+    `aggregate_per_patient`), então `probe/dice_teacher_eval` reproduz `val/dice_patient`.
+    No-op em módulos sem `teacher`.
+
+    Args:
+        num_classes: incluindo o fundo.
+        class_ids: `{class_index: nome}`; default = `report_class_ids` do módulo.
+        recal_batches: lotes de treino recentes guardados (CPU) para a recalibração do BN.
+        train_eval_batches: quantos lotes iniciais fornecem o subconjunto fixo de treino.
+        unlabeled_probe_batches: quantos lotes recentes entram no `fg_frac_unl_*`.
+    '''
+
+    def __init__(self, num_classes: int, class_ids=None, recal_batches: int = 32,
+                 train_eval_batches: int = 8, unlabeled_probe_batches: int = 4):
+        super().__init__()
+        from collections import deque
+        self.num_classes = num_classes
+        self.class_ids = class_ids
+        self.recent = deque(maxlen=max(int(recal_batches), 1))   # (images, is_labeled) em CPU
+        self.train_eval_batches = int(train_eval_batches)
+        self.unlabeled_probe_batches = int(unlabeled_probe_batches)
+        self.fixed_train = []                                     # (images, masks) rotulados, em CPU
+        self._val_batches = None
+        self._fg_frac_gt = None
+
+    def _resolve_class_ids(self, pl_module):
+        if self.class_ids is not None:
+            if isinstance(self.class_ids, DictConfig):
+                self.class_ids = OmegaConf.to_container(self.class_ids, resolve=True)
+            return {int(k): str(v) for k, v in dict(self.class_ids).items()}
+        return pl_module.report_class_ids
+
+    # ------------------------------------------------------------------ coleta durante o treino
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        if not hasattr(pl_module, "teacher"):
+            return
+        images = batch["image"].detach().cpu()
+        is_labeled = pl_module.labeled_mask(batch).cpu()
+        self.recent.append((images, is_labeled))
+        if len(self.fixed_train) < self.train_eval_batches and is_labeled.any():
+            self.fixed_train.append((images[is_labeled], batch["segmentation"].detach().cpu()[is_labeled]))
+
+    # ------------------------------------------------------------------ medidas
+
+    def _materialize_val(self, trainer):
+        '''A val é pequena (~110 frames): guardar em CPU evita recriar o DataLoader 4x por validação.'''
+        if self._val_batches is None:
+            self._val_batches = [
+                {"image": b["image"], "segmentation": b["segmentation"], "metadata": b["metadata"]}
+                for b in trainer.datamodule.val_dataloader()
+            ]
+            fg = [(b["segmentation"] > 0).float().mean() for b in self._val_batches]
+            self._fg_frac_gt = float(torch.stack(fg).mean())
+        return self._val_batches
+
+    @staticmethod
+    def _counting_forward(network, counter):
+        def forward(images):
+            logits = network(images)
+            counter.append(float((logits.argmax(dim=1) > 0).float().mean()))
+            return logits
+        return forward
+
+    def _patient_dice(self, pl_module, batches, network, class_ids, device):
+        from src.evaluation import aggregate_per_patient, evaluate_per_class
+        fg = []
+        per_sample = evaluate_per_class(
+            pl_module, batches, num_classes=self.num_classes, class_ids=class_ids,
+            device=device, forward_fn=self._counting_forward(network, fg),
+        )
+        aggregated = aggregate_per_patient(per_sample)
+        return float(aggregated["dice"].mean(skipna=True)), (sum(fg) / len(fg) if fg else float("nan"))
+
+    @staticmethod
+    def _bn_stats(network):
+        variances = [m.running_var for m in network.modules()
+                     if isinstance(m, torch.nn.modules.batchnorm._BatchNorm) and m.running_var is not None]
+        if not variances:
+            return {}
+        flat = torch.cat([v.detach().flatten().float() for v in variances])
+        nonfinite = int((~torch.isfinite(flat)).sum())
+        finite = flat[torch.isfinite(flat)]
+        return {
+            "bn_var_min": float(finite.min()) if finite.numel() else float("nan"),
+            "bn_var_max": float(finite.max()) if finite.numel() else float("nan"),
+            "bn_nonfinite": float(nonfinite),
+        }
+
+    @staticmethod
+    def _param_dist(teacher, student):
+        num, den = 0.0, 0.0
+        for t, s in zip(teacher.parameters(), student.parameters()):
+            num += float(((t.detach() - s.detach()) ** 2).sum())
+            den += float((s.detach() ** 2).sum())
+        return (num ** 0.5) / max(den ** 0.5, 1e-12)
+
+    @torch.no_grad()
+    def _frame_dice(self, pl_module, network, device):
+        values = []
+        for images, masks in self.fixed_train:
+            logits = network(images.to(device))
+            values.append(pl_module.compute_metrics(logits, masks.to(device), stage="train")["dice_score"])
+        return float(torch.stack(values).nanmean()) if values else float("nan")
+
+    @torch.no_grad()
+    def _unlabeled_fg(self, network, device):
+        fractions = []
+        for images, is_labeled in list(self.recent)[-self.unlabeled_probe_batches:]:
+            unlabeled = images[~is_labeled]
+            if unlabeled.shape[0] == 0:
+                continue
+            fractions.append(float((network(unlabeled.to(device)).argmax(dim=1) > 0).float().mean()))
+        return sum(fractions) / len(fractions) if fractions else float("nan")
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        if trainer.sanity_checking or not hasattr(pl_module, "teacher"):
+            return
+        import copy
+        from src.models.ssl.mean_teacher import recalibrate_batchnorm
+
+        device = trainer.strategy.root_device
+        class_ids = self._resolve_class_ids(pl_module)
+        was_training = pl_module.training
+        batches = self._materialize_val(trainer)
+        teacher, student = pl_module.teacher, pl_module.model
+        logs = {"probe/fg_frac_gt": self._fg_frac_gt}
+
+        # evaluate_per_class põe o módulo inteiro (teacher e student) em eval mode.
+        logs["probe/dice_teacher_eval"], logs["probe/fg_frac_teacher"] = self._patient_dice(
+            pl_module, batches, teacher, class_ids, device)
+        logs["probe/dice_student_eval"], logs["probe/fg_frac_student"] = self._patient_dice(
+            pl_module, batches, student, class_ids, device)
+
+        recal = copy.deepcopy(teacher)
+        n_used = recalibrate_batchnorm(recal, [images for images, _ in self.recent])
+        recal.eval()
+        if n_used:
+            logs["probe/dice_teacher_bnrecal"], logs["probe/fg_frac_teacher_bnrecal"] = self._patient_dice(
+                pl_module, batches, recal, class_ids, device)
+        del recal
+
+        trainbn = copy.deepcopy(teacher).train()   # cópia: os running stats do teacher real ficam intactos
+        try:
+            logs["probe/dice_teacher_trainbn"], _ = self._patient_dice(pl_module, batches, trainbn, class_ids, device)
+        except ValueError as error:
+            # BN em train mode recusa um lote de 1 amostra (o ramo de pooling do ASPP tem 1x1 espacial).
+            print(f"MTEvalProbe: dice_teacher_trainbn indisponivel ({error})")
+        del trainbn
+
+        teacher.eval()
+        student.eval()
+        logs["probe/train_dice_eval_student"] = self._frame_dice(pl_module, student, device)
+        logs["probe/train_dice_eval_teacher"] = self._frame_dice(pl_module, teacher, device)
+        logs["probe/fg_frac_unl_teacher"] = self._unlabeled_fg(teacher, device)
+        logs["probe/fg_frac_unl_student"] = self._unlabeled_fg(student, device)
+        logs["probe/param_dist"] = self._param_dist(teacher, student)
+        for name, network in (("teacher", teacher), ("student", student)):
+            for key, value in self._bn_stats(network).items():
+                logs[f"probe/{key}_{name}"] = value
+
+        if was_training:
+            pl_module.train()
+
+        logs = {k: float(v) for k, v in logs.items() if v == v}   # descarta NaN
+        pl_module.log_dict(logs, prog_bar=False, logger=True, on_step=False, on_epoch=True,
+                           sync_dist=True)
+
+
 class ResourceMonitor(Callback):
     '''
     Custo de um run, para comparar métodos além da acurácia: tempo, VRAM, tamanho do modelo e carga

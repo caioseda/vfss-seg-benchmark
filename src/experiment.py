@@ -350,6 +350,25 @@ class Experiment:
             every_n_train_steps=every_n_train_steps, save_on_train_epoch_end=False,
         )
 
+    def _build_snapshot_checkpoint_callback(self) -> Optional[ModelCheckpoint]:
+        '''
+        Snapshots PERSISTENTES ao longo da run, configurados por um bloco opcional
+        `trainer.snapshots: {every_n_train_steps: N}`. Ao contrário de `last.ckpt` (apagado no fim) e do
+        `best` (um só), guarda `checkpoints/snapshots/snap-step=<k>.ckpt` a cada N passos -- é o que
+        permite analisar post-hoc o que aconteceu DEPOIS do best-ckpt (ex.: o colapso do teacher no E2).
+        Custa um checkpoint por snapshot em disco; por isso só existe quando o config pede.
+        '''
+        snapshots_cfg = self.config.trainer.get("snapshots")
+        if not snapshots_cfg:
+            return None
+        every = int(snapshots_cfg.get("every_n_train_steps", 1000))
+        return ModelCheckpoint(
+            dirpath=str(self.experiment_run_dir / "checkpoints" / "snapshots"),
+            filename="snap-{step}",
+            monitor=None, save_top_k=-1, save_last=False,
+            every_n_train_steps=every, save_on_train_epoch_end=False,
+        )
+
     def run(self, fast_dev_run: bool | int = False, seed=42,
             resume: bool = True, force_resume: bool = False,
             resume_every_n_train_steps: int = 500) -> Dict[str, Any]:
@@ -398,7 +417,10 @@ class Experiment:
                 callbacks.append(checkpoint_callback)
             if not fast_dev_run:
                 callbacks.append(self._build_resume_checkpoint_callback(resume_every_n_train_steps))
-            
+                snapshot_callback = self._build_snapshot_checkpoint_callback()
+                if snapshot_callback is not None:
+                    callbacks.append(snapshot_callback)
+
             trainer_params = OmegaConf.to_container(self.config["trainer"]["params"], resolve=True)
             if fast_dev_run:
                 trainer_params["fast_dev_run"] = fast_dev_run

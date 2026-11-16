@@ -295,7 +295,8 @@ class E2SweepTests(unittest.TestCase):
         plan = self.sweep.plan
         cells = plan.cells()
         self.assertEqual([c["method"] for c in cells],
-                         ["supervised", "fixmatch", "meanteacher", "mt-temporal-prev", "mt-temporal-bi", "mt-temporal-prev3"])
+                         ["supervised", "fixmatch", "meanteacher", "mt-temporal-prev", "mt-temporal-bi", "mt-temporal-prev3",
+                          "dtc-trus"])
         overrides = plan.overrides(cells[0])
         frozen = plan.frozen_hparams["deeplabv3plus"]
         self.assertEqual(overrides["optimizer"]["params"]["lr"], frozen["lr"])
@@ -349,15 +350,29 @@ class E2CVSweepTests(unittest.TestCase):
 
     def test_grid_is_folds_by_methods_with_method_innermost(self):
         cells = self.sweep.plan.cells()
-        self.assertEqual(len(cells), 30)
-        self.assertEqual([c["fold"] for c in cells[:6]], [0] * 6)
-        self.assertEqual([c["method"] for c in cells[:6]],
-                         ["supervised", "fixmatch", "meanteacher", "mt-temporal-prev", "mt-temporal-bi", "mt-temporal-prev3"])
+        self.assertEqual(len(cells), 35)
+        self.assertEqual([c["fold"] for c in cells[:7]], [0] * 7)
+        self.assertEqual([c["method"] for c in cells[:7]],
+                         ["supervised", "fixmatch", "meanteacher", "mt-temporal-prev", "mt-temporal-bi", "mt-temporal-prev3",
+                          "dtc-trus"])
         run_ids = [self.sweep.plan.run_id(c) for c in cells]
-        self.assertEqual(len(set(run_ids)), 30)
+        self.assertEqual(len(set(run_ids)), 35)
         self.assertEqual(run_ids[0], "deeplabv3plus-supervised-global-f0-s42")
 
+    def write_supervised_state(self):
+        '''O `dtc-trus` le a etapa 1 (a `supervised` do fold) do state.json: uma sintetica, concluida.'''
+        import json
+        cells = {}
+        for cell in self.sweep.plan.cells():
+            if cell["method"] == "supervised":
+                checkpoint = Path(self.tmp) / f"{self.sweep.plan.run_id(cell)}.ckpt"
+                checkpoint.write_text("x")
+                cells[self.sweep.plan.run_id(cell)] = {"status": "done", "best_checkpoint_path": str(checkpoint)}
+        self.sweep.sweep_dir.mkdir(parents=True, exist_ok=True)
+        self.sweep.state_path.write_text(json.dumps({"cells": cells}))
+
     def test_overrides_hold_out_the_fold_and_never_the_inca_test(self):
+        self.write_supervised_state()
         plan = self.sweep.plan
         for cell in plan.cells():
             overrides = plan.overrides(cell)
@@ -371,6 +386,7 @@ class E2CVSweepTests(unittest.TestCase):
 
     def test_merged_config_is_a_valid_cv_split(self):
         '''YAML do treino final (`holdout_test: true`) + overrides do CV -> split aceito, fold k em 'test'.'''
+        self.write_supervised_state()
         plan = self.sweep.plan
         cell = plan.cells()[-1]
         merged = OmegaConf.merge(OmegaConf.load(plan.experiment_config(cell)), plan.overrides(cell))

@@ -26,6 +26,10 @@ from typing import Dict
 
 class FixMatchLitWrapper(SemiSupervisedLitWrapper):
 
+    # `student_augment` só nos ROTULADOS: os não rotulados já têm as próprias views weak/strong.
+    supports_student_augment = True
+    student_augment_rows = "labeled"
+
     def __init__(self, *args, confidence_threshold: float = 0.95,
                  cutout_prob: float = 0.5, **kwargs):
         '''

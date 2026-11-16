@@ -28,20 +28,48 @@ Os cenários 4 e 5 diferem só em `neighbor_offsets` do dataset (`[-1]` vs `[-1,
 os K vizinhos que o batch trouxer, então uma janela maior não exige mudança aqui.
 '''
 
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from torch import Tensor
 
 from .base import sigmoid_rampup
 from .mean_teacher import MeanTeacherLitWrapper
-from ...data.augmentations import gaussian_noise
+from ...data.augmentations import gaussian_noise, weak_augment_temporal
 from ...data.optical_flow import WARP_CONVENTIONS, warp
 
 NEIGHBOR_KEYS = ("neighbors", "neighbor_flow", "neighbor_confidence", "neighbor_valid")
 
 
-class TemporalMeanTeacherLitWrapper(MeanTeacherLitWrapper):
+class TemporalAugmentMixin:
+    '''
+    `student_augment` para batches com vizinhos temporais: a mesma geometria do central vai aos vizinhos,
+    ao fluxo (reamostrado E com os vetores girados/escalados) e ao M_noc -- `weak_augment_temporal`.
+    Compartilhado pelo MT temporal e pelo DTC-TRUS; precisa vir ANTES de `SemiSupervisedLitWrapper` na MRO.
+    '''
+
+    def _augmented_keys(self, batch: Dict) -> List[str]:
+        keys = super()._augmented_keys(batch)
+        if all(key in batch for key in NEIGHBOR_KEYS):
+            keys += ["neighbors", "neighbor_flow", "neighbor_confidence"]
+        return keys
+
+    def _weak_augment_rows(self, rows: Dict[str, Tensor]) -> Dict[str, Tensor]:
+        if "neighbor_flow" not in rows:
+            return super()._weak_augment_rows(rows)
+        mask_keys = [key for key in ("segmentation", "hidden_segmentation") if key in rows]
+        image, masks, neighbors, flow, confidence = weak_augment_temporal(
+            rows["image"], [rows[key] for key in mask_keys],
+            rows["neighbors"], rows["neighbor_flow"], rows["neighbor_confidence"])
+        return {"image": image, **dict(zip(mask_keys, masks)), "neighbors": neighbors,
+                "neighbor_flow": flow, "neighbor_confidence": confidence}
+
+
+class TemporalMeanTeacherLitWrapper(TemporalAugmentMixin, MeanTeacherLitWrapper):
+
+    # `student_augment` leva a mesma geometria do central aos vizinhos, ao fluxo e ao M_noc
+    # (`TemporalAugmentMixin`).
+    supports_student_augment = True
 
     def __init__(self, *args,
                  temporal_weight: float = 0.1,
@@ -130,6 +158,7 @@ class TemporalMeanTeacherLitWrapper(MeanTeacherLitWrapper):
     # ------------------------------------------------------------------ training
 
     def training_step(self, batch, batch_idx):
+        batch = self.augment_batch(batch)
         images, targets = batch["image"], batch["segmentation"]
         is_labeled = self.labeled_mask(batch).to(images.device)
         unlabeled = ~is_labeled

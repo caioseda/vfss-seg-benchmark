@@ -27,6 +27,10 @@ model:
 lit_module:
   target: src.models.ssl.fixmatch.FixMatchLitWrapper
   params:
+    # Augmentation fraca (flip + afim leve, src/data/augmentations.py) -- fator COMUM a todos os metodos do E2;
+    # sem ela os MT colapsam para "tudo fundo" quando a consistencia amadurece (e2_03_colapso_mt.ipynb).
+    # Aqui: so nos rotulados; os nao rotulados mantem as views weak/strong do FixMatch.
+    student_augment: weak
     report_class_ids: {1: FG}
     surface_metric_stages: [test]
     confidence_threshold: 0.95

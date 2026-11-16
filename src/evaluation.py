@@ -212,6 +212,9 @@ def paired_fold_differences(per_fold: pd.DataFrame, by: str, reference,
 # (coluna em `resources`, rótulo na tabela, fator de escala). A ordem é a ordem das colunas.
 RESOURCE_COLUMNS = (
     ("fit_wall_s", "tempo total (h)", 1 / 3600),
+    # = `fit_wall_s` + o da etapa 1 nos métodos de duas etapas (DTC-TRUS: a célula `supervised` pareada;
+    # `src/sweeps/e2.py`). Nos demais, igual a `fit_wall_s`.
+    ("total_fit_wall_s", "tempo total c/ etapa 1 (h)", 1 / 3600),
     ("s_per_step_mean", "s/passo", 1.0),
     ("data_wait_frac", "espera por dados (%)", 100.0),
     ("vram_train_peak_gb", "VRAM treino (GB)", 1.0),

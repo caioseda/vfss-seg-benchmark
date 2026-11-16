@@ -21,6 +21,64 @@ class TinyNet(nn.Module):
         return self.net(x)
 
 
+class TinyBNNet(nn.Module):
+    '''`TinyNet` with a BatchNorm, for the tests that are about BN running statistics.'''
+
+    def __init__(self, n_channels: int = 3, n_classes: int = 2, hidden: int = 8):
+        super().__init__()
+        self.n_channels = n_channels
+        self.n_classes = n_classes
+        self.net = nn.Sequential(
+            nn.Conv2d(n_channels, hidden, 3, padding=1),
+            nn.BatchNorm2d(hidden),
+            nn.ReLU(),
+            nn.Conv2d(hidden, n_classes, 3, padding=1),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class TinyFeatureNet(nn.Module):
+    '''
+    `TinyBNNet` com o contrato `forward_features` do `SMPModel` (logits, local, global), para o DTC-TRUS.
+    O mapa local fica a 1/2 da resolução (como a DeepLabV3+ fica a 1/4) e o global a 1/4, para exercitar a
+    reamostragem de máscaras e fluxo.
+    '''
+
+    def __init__(self, n_channels: int = 3, n_classes: int = 2, hidden: int = 8):
+        super().__init__()
+        self.n_channels = n_channels
+        self.n_classes = n_classes
+        self.encoder = nn.Sequential(nn.Conv2d(n_channels, hidden, 3, stride=2, padding=1),
+                                     nn.BatchNorm2d(hidden), nn.ReLU())
+        self.bottleneck = nn.Sequential(nn.Conv2d(hidden, hidden, 3, stride=2, padding=1), nn.ReLU())
+        self.decoder = nn.Sequential(nn.Conv2d(2 * hidden, hidden, 3, padding=1), nn.ReLU())
+        self.head = nn.Sequential(nn.Conv2d(hidden, n_classes, 1), nn.Upsample(scale_factor=2, mode="bilinear"))
+
+    def forward_features(self, x):
+        skip = self.encoder(x)
+        bottom = self.bottleneck(skip)
+        up = nn.functional.interpolate(bottom, size=skip.shape[-2:], mode="nearest")
+        local = self.decoder(torch.cat([skip, up], dim=1))
+        return self.head(local), local, bottom
+
+    def forward(self, x):
+        return self.forward_features(x)[0]
+
+
+TINY_FEATURE_MODEL_CFG = {
+    "target": "tests.helpers.TinyFeatureNet",
+    "params": {"n_channels": 3, "n_classes": 2, "hidden": 8},
+}
+
+
+TINY_BN_MODEL_CFG = {
+    "target": "tests.helpers.TinyBNNet",
+    "params": {"n_channels": 3, "n_classes": 2, "hidden": 8},
+}
+
+
 TINY_MODEL_CFG = {
     "target": "tests.helpers.TinyNet",
     "params": {"n_channels": 3, "n_classes": 4, "hidden": 8},

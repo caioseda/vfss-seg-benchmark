@@ -56,6 +56,8 @@ SEMI_SUPERVISED_BASES = ("reference", "canonical")
 
 class DiffRectLitWrapper(SemiSupervisedLitWrapper):
 
+    supports_student_augment = False   # passo de treino próprio, com augmentation própria
+
     def __init__(
         self,
         *args,

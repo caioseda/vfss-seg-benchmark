@@ -27,6 +27,10 @@ model:
 lit_module:
   target: src.models.ssl.mean_teacher.MeanTeacherLitWrapper
   params:
+    # Augmentation fraca (flip + afim leve, src/data/augmentations.py) -- fator COMUM a todos os metodos do E2;
+    # sem ela os MT colapsam para "tudo fundo" quando a consistencia amadurece (e2_03_colapso_mt.ipynb).
+    # Aqui: rotulados e nao rotulados; o teacher ve a mesma geometria do student.
+    student_augment: weak
     report_class_ids: {1: FG}
     surface_metric_stages: [test]
     ema_decay: 0.99
@@ -73,6 +77,13 @@ trainer:
         num_classes: 2
         class_ids: {1: FG}
     # Tempo, VRAM, tamanho do modelo e carga por passo -> run.json (`resources`) e a tabela comparativa.
+    # Validacao tambem pelo STUDENT (val_student/dice_patient): o colapso aparece nele primeiro.
+    - target: src.callbacks.PatientValidation
+      params:
+        num_classes: 2
+        class_ids: {1: FG}
+        prefix: val_student
+        forward_attr: forward
     - target: src.callbacks.ResourceMonitor
       params:
         input_size: 256

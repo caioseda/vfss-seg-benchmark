@@ -10,20 +10,21 @@
 # Agregacao frames -> paciente -> fold, media ± desvio entre folds e diferencas pareadas por fold:
 # notebooks/artigo/e2_ssl_temporal/e2_02_cv.ipynb.
 #
-# Custo: 5 folds x 6 metodos = 30 runs de 8000 passos por (arch, politica, seed).
+# Custo: 5 folds x 7 metodos = 35 runs de 8000 passos por (arch, politica, seed); o `dtc-trus` reusa o
+# `supervised` do mesmo fold como etapa 1 (nao ha run extra de etapa 1).
 type: sweep
 name: e2-cv
 family: e2-cv
 plan: src.sweeps.e2.E2CVSweep
 
 # `method` mais interno, `fold` logo acima: se a grade for cortada, os folds concluidos tem todos os
-# metodos, pareados pelo mesmo fold/seed/politica. `mt-temporal-prev3` vai por ultimo (comparacao de T).
+# metodos, pareados pelo mesmo fold/seed/politica. `dtc-trus` vai por ultimo: precisa do `supervised` do fold.
 axes:
   seed: [42]
   arch: [deeplabv3plus]           # vencedora do E1; qualquer chave de `arch_configs`
   unlabeled_policy: [global]      # [global, same_video] para comparar as duas origens
   fold: [0, 1, 2, 3, 4]
-  method: [supervised, fixmatch, meanteacher, mt-temporal-prev, mt-temporal-bi, mt-temporal-prev3]
+  method: [supervised, fixmatch, meanteacher, mt-temporal-prev, mt-temporal-bi, mt-temporal-prev3, dtc-trus]
 
 # Os mesmos YAMLs do treino final: o sweep troca `holdout_test` por `cv_fold`.
 base_configs:
@@ -33,6 +34,13 @@ base_configs:
   mt-temporal-prev: configs/experiment/e2/e2-mt-temporal-prev.yaml
   mt-temporal-bi:   configs/experiment/e2/e2-mt-temporal-bi.yaml
   mt-temporal-prev3: configs/experiment/e2/e2-mt-temporal-prev3.yaml   # T=3 (vizinho t-3)
+  dtc-trus:         configs/experiment/e2/e2-dtc-trus.yaml           # etapa 2; etapa 1 = `teacher_from`
+
+# Metodos de duas etapas: a etapa 1 de `dtc-trus` e o best.ckpt da celula `supervised` com as mesmas demais
+# coordenadas (seed/arch/politica[/fold]), lido de _sweep/state.json -- nao e re-treinada. `supervised` tem
+# de vir antes em `axes.method`. O custo da etapa 1 entra como `stage1_*` / `total_*` na CSV de custo.
+teacher_from:
+  dtc-trus: supervised
 
 arch_configs:
   unet:          configs/experiment/e1/e1-unet.yaml
