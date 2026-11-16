@@ -1,0 +1,41 @@
+# Hosts em que `scripts/remote.py` lanca sweeps em container. Lido so por scripts/remote.py.
+#
+# {user} e substituido pelo usuario do SSH (padrao: o seu usuario local).
+#
+# Layout de `root` em cada host (tudo criado com o SEU uid antes do `docker run`, para que nada fique
+# com dono root e voce possa ler, mover e apagar o que o container gravou):
+#   data/            copia dos datasets (remote.py setup)             -> montado em `paths.data`, so leitura
+#   code/<container> retrato do repositorio no momento do submit      -> montado na raiz do repo
+#   logs/            saidas dos runs                                  -> montado em <repo>/logs
+#   cache/           HOME, TORCH_HOME, HF_HOME (pesos ImageNet do smp) -> /cache
+defaults:
+  user: null               # null = o usuario local ($USER)
+  root: /local/{user}/vfss
+  gpu: 1                   # indice do nvidia-smi; o container so enxerga esta GPU
+  shm_size: 16g            # /dev/shm para os 8 workers do DataLoader
+  quota_gb: 200            # limite de disco em `root` (setup e submit conferem)
+
+hosts:
+  dl01:
+    ssh: DeepLearning01
+  dl05:
+    ssh: Deeplearning05
+  # A delaunay com Docker: sem SSH nem copia de codigo/dados -- monta o repositorio e os dados reais.
+  # Para rodar sem Docker na delaunay, continue usando scripts/submit.sh.
+  delaunay:
+    local: true
+    gpu: 0
+    root: /data_ssd/{user}/vfss-docker   # so o cache do container fica aqui
+
+# Caminhos da delaunay que o container reproduz. Montar os dados e o repositorio nos MESMOS caminhos
+# faz os YAMLs funcionarem sem alteracao e deixa `output_dir`/`best_checkpoint_path` validos na
+# delaunay depois do `remote.py sync`.
+paths:
+  data: /data_ssd/caioseda/data
+
+# Pacotes locais instalados em modo editavel no env `vfss` (pip install -e), que a imagem nao tem.
+# Cada diretorio vai no retrato do codigo, e montado no MESMO caminho (so leitura) e entra no PYTHONPATH.
+python_paths:
+  - /home/caioseda/projetos/vfss-data-split/src     # vfss_data_split (src/data/vfss.py)
+
+image: vfss-seg

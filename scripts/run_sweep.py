@@ -8,6 +8,11 @@ Roda uma grade de experimentos em primeiro plano. E este processo que o tmux man
 Para que sobreviva a queda do SSH, use `scripts/submit.sh`, que o lanca numa sessao tmux destacada.
 Rodar de novo apos uma queda e seguro e e o fluxo esperado: celulas concluidas sao puladas e a
 celula interrompida retoma de `last.ckpt`.
+
+Dividir a grade entre servidores (ver scripts/remote.py, que lanca cada parte num container):
+
+    python scripts/run_sweep.py --config configs/sweep/e2-cv.yaml --shard 1/2 --dry-run
+    python scripts/run_sweep.py --config configs/sweep/e2-cv.yaml --shard 2/2 --dry-run
 '''
 import sys
 from pathlib import Path
@@ -35,9 +40,15 @@ def main() -> int:
                         help="fast_dev_run do Lightning; nao grava resultados")
     parser.add_argument("--set", nargs="*", default=[], metavar="CHAVE=VALOR",
                         help="sobrescritas da config do sweep, em dotlist (ex.: axes.arch=[fpn])")
+    parser.add_argument("--shard", default=None, metavar="K/N",
+                        help="roda so a K-esima de N partes da grade, 1-indexado (ex.: 1/2 e 2/2). "
+                             "1/1 roda tudo, isolado em _sweep/<tag>/")
+    parser.add_argument("--shard-tag", default=None,
+                        help="nome do diretorio do shard (padrao: $VFSS_SHARD_TAG ou o hostname)")
     args = parser.parse_args()
 
-    sweep = Sweep(args.config, log_dir=args.log_dir, overrides=args.set)
+    sweep = Sweep(args.config, log_dir=args.log_dir, overrides=args.set,
+                  shard=args.shard, shard_tag=args.shard_tag)
     sweep.run(fast_dev_run=args.fast_dev_run, force_resume=args.force_resume, dry_run=args.dry_run)
     return 0
 

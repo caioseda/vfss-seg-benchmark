@@ -46,6 +46,15 @@ dependencies:
     # Encoders ResNet34/ImageNet + decoders U-Net/U-Net++/FPN/DeepLabv3+ do E1 (src/models/smp_adapters.py).
     # Os pesos ImageNet sao baixados no primeiro uso e ficam no cache do torch/hf.
     - segmentation-models-pytorch==0.5.0
+    # Importados por src/models/unet_plus_plus (pad_nd_image) e src/data (cv2), mas ausentes daqui ate a
+    # imagem Docker (docker/Dockerfile) acusar -- o env `vfss` os tinha por instalacao manual. Versoes do env.
+    # `-headless`: sem libGL, que nem o container nem um servidor sem tela tem.
+    - batchgenerators==0.25.1
+    - opencv-python-headless==4.13.0.92
+    # vfss_data_split (src/data/vfss.py) NAO vem daqui: e o pacote local ~/projetos/vfss-data-split, instalado
+    # em modo editavel. No container ele entra por `python_paths` em configs/remote_hosts.yaml; a dependencia
+    # dele que este arquivo nao cobria era o pydantic.
+    - pydantic>=2
     # So o RandomSampler, para amostrar os pontos do tuning A.1 (src/tuning.py).
     - optuna==4.9.0
     # Only needed to PREPARE the ACDC reproduction data (scripts/prepare_acdc.py reads .nii.gz).

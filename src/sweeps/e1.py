@@ -39,6 +39,8 @@ from src.tuning import (
 
 
 class _E1Sweep(SweepPlan):
+    # O E1 compara arquiteturas: todas as arquiteturas de um fold/seed rodam no mesmo shard.
+    compared_axes = ("arch",)
 
     def experiment_config(self, cell: Dict[str, Any]) -> str:
         '''A arquitetura e o eixo que escolhe o YAML base, nao `method` (o metodo e sempre supervisionado).'''
@@ -123,6 +125,10 @@ class E1TuningSweep(_E1TuningStage):
     `state.json`; a CSV de resultados continua sendo a fonte de verdade de "pronto", e `begin` devolve ao
     study qualquer trial que a CSV ja tenha e o study ainda nao (queda entre a CSV e o `tell`).
     '''
+
+    # O ponto do trial n vem do study (TPE) depois dos trials anteriores: dois processos com journals
+    # separados amostrariam studies diferentes.
+    shardable = False
 
     def axes(self) -> Dict[str, List[Any]]:
         axes = super().axes()

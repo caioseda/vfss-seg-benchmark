@@ -43,6 +43,9 @@ from src.utils import instantiate_from_config
 class E2Sweep(E1CVSweep):
     '''Célula = (seed, arch, unlabeled_policy, method). Herda `frozen_hparams` e `_protocol_overrides` do E1.'''
 
+    # O E2 compara métodos; a arquitetura é fixa por unidade (diferente do E1, de quem herda).
+    compared_axes = ("method",)
+
     def run_id(self, cell: Dict[str, Any]) -> str:
         return f"{cell['arch']}-{cell['method']}-{cell['unlabeled_policy']}-s{cell['seed']}"
 
@@ -176,7 +179,7 @@ class E2Sweep(E1CVSweep):
 
     @property
     def resources_csv(self) -> Path:
-        return self.log_dir / self.family / str(self.config.get("resources_csv", "results_resources.csv"))
+        return self.tables_dir / str(self.config.get("resources_csv", "results_resources.csv"))
 
     def load_resources(self) -> pd.DataFrame:
         return pd.read_csv(self.resources_csv) if self.resources_csv.exists() else pd.DataFrame()

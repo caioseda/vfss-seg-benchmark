@@ -16,7 +16,7 @@ the cartesian product, the run naming and the per-sample evaluation have working
 '''
 from itertools import product
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 from omegaconf import DictConfig, OmegaConf
@@ -27,6 +27,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 class SweepPlan:
+    # Eixos cujos valores sao COMPARADOS entre si -- as celulas que so diferem neles formam uma unidade
+    # de pareamento, que um shard nunca separa (ver `pairing_key`). O YAML do sweep pode sobrescrever
+    # com `compared_axes: [...]`.
+    compared_axes: Tuple[str, ...] = ("method",)
+    # Um plano cujas celulas dependem de estado mantido ENTRE celulas (um study do Optuna) nao pode
+    # ser dividido entre processos que nao compartilham esse estado.
+    shardable: bool = True
+
     def __init__(self, config: DictConfig, log_dir: Optional[str | Path] = None):
         self.config = config
         self.family: str = config.family
@@ -34,10 +42,34 @@ class SweepPlan:
         # The same root the `Sweep` writes under. Only plans that keep state of their own (an Optuna
         # study) or read another family's results need it.
         self.log_dir = Path(log_dir).resolve() if log_dir else PROJECT_ROOT / "logs"
+        # Preenchido pelo `Sweep` quando roda como shard: `logs/<familia>/_sweep/<tag>/`.
+        self.shard_dir: Optional[Path] = None
 
     @property
     def sweep_dir(self) -> Path:
-        return self.log_dir / self.family / "_sweep"
+        '''Estado do runner (state.json, console.log, configs compostas). Num shard, o do shard.'''
+        return self.shard_dir or self.log_dir / self.family / "_sweep"
+
+    @property
+    def tables_dir(self) -> Path:
+        '''
+        Onde as CSVs de resultado deste processo sao gravadas. Num shard elas ficam no diretorio do
+        shard -- dois hosts nunca escrevem o mesmo arquivo, e `scripts/remote.py merge` consolida a
+        CSV canonica de `logs/<familia>/` que os notebooks leem.
+        '''
+        return self.shard_dir or self.log_dir / self.family
+
+    # ------------------------------------------------------------------ sharding
+
+    def pairing_key(self, cell: Dict[str, Any]) -> Tuple[Any, ...]:
+        '''
+        Identidade da unidade de pareamento: a celula sem os eixos comparados. Todas as celulas com a
+        mesma chave rodam no mesmo shard, logo na mesma GPU -- a diferenca pareada entre metodos de um
+        mesmo fold/seed nao absorve o efeito de hardware, e metodos de duas etapas (DTC-TRUS) acham a
+        etapa 1 no `state.json` do proprio shard.
+        '''
+        compared = set(self.config.get("compared_axes") or self.compared_axes)
+        return tuple((key, value) for key, value in cell.items() if key not in compared)
 
     # ------------------------------------------------------------------ the grid
 
