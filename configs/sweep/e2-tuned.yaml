@@ -1,0 +1,89 @@
+# E2 (treino final) com os pesos SSL AJUSTADOS -- a linha "ajustado" do artigo, ao lado da "padrao"
+# (e2.yaml, pesos dos YAMLs base). Identico a configs/sweep/e2.yaml fora de `name`/`family` e do
+# bloco `ssl_hparams_*`; familia propria (logs/e2-tuned/), entao nada do e2 e tocado. O `supervised`
+# e retreinado aqui para manter o pareamento (e o professor do DTC-TRUS) dentro da familia.
+#
+#   python scripts/run_sweep.py --config configs/sweep/e2-tuned.yaml --dry-run
+#   python scripts/remote.py submit dl05 configs/sweep/e2-tuned.yaml
+#
+# So treina depois do congelamento (configs/frozen/e2-ssl-hparams.yaml).
+type: sweep
+name: e2-tuned
+family: e2-tuned
+plan: src.sweeps.e2.E2Sweep
+
+# `method` mais interno: se a grade for cortada, os metodos concluidos seguem pareados por seed/politica.
+axes:
+  seed: [42]
+  arch: [deeplabv3plus]           # vencedora do E1; qualquer chave de `arch_configs`
+  unlabeled_policy: [global]      # [global, same_video] para comparar as duas origens
+  method: [supervised, fixmatch, meanteacher, mt-temporal-prev, mt-temporal-bi, mt-temporal-prev3, mt-temporal-proto-teacher, mt-temporal-proto-student, mt-temporal-nomt, dtc-trus]
+
+base_configs:
+  supervised:       configs/experiment/e2/e2-supervised.yaml
+  fixmatch:         configs/experiment/e2/e2-fixmatch.yaml
+  meanteacher:      configs/experiment/e2/e2-meanteacher.yaml
+  mt-temporal-prev: configs/experiment/e2/e2-mt-temporal-prev.yaml
+  mt-temporal-bi:   configs/experiment/e2/e2-mt-temporal-bi.yaml
+  mt-temporal-prev3: configs/experiment/e2/e2-mt-temporal-prev3.yaml   # T=3 (vizinho t-3)
+  mt-temporal-proto-teacher: configs/experiment/e2/e2-mt-temporal-proto-teacher.yaml   # prev + L_proto, vizinho do teacher
+  mt-temporal-proto-student: configs/experiment/e2/e2-mt-temporal-proto-student.yaml   # prev + L_proto, student nos 2 frames
+  mt-temporal-nomt: configs/experiment/e2/e2-mt-temporal-nomt.yaml                     # prev com consistency_weight=0
+  dtc-trus:         configs/experiment/e2/e2-dtc-trus.yaml           # etapa 2; etapa 1 = `teacher_from`
+
+# Metodos de duas etapas: a etapa 1 de `dtc-trus` e o best.ckpt da celula `supervised` com as mesmas demais
+# coordenadas (seed/arch/politica[/fold]), lido de _sweep/state.json -- nao e re-treinada. `supervised` tem
+# de vir antes em `axes.method`. O custo da etapa 1 entra como `stage1_*` / `total_*` na CSV de custo.
+teacher_from:
+  dtc-trus: supervised
+
+# De onde vem o bloco `model` de cada arquitetura (o mesmo do E1).
+arch_configs:
+  unet:          configs/experiment/e1/e1-unet.yaml
+  unetplusplus:  configs/experiment/e1/e1-unetplusplus.yaml
+  fpn:           configs/experiment/e1/e1-fpn.yaml
+  deeplabv3plus: configs/experiment/e1/e1-deeplabv3plus.yaml
+  swinunet_tiny: configs/experiment/e1/e1-swinunet-tiny.yaml
+
+# lr/wd congelados pelo tuning do E1.
+hparams_file: configs/frozen/e1-hparams.yaml
+
+# Pesos SSL congelados pelo tuning do E2 (docs/e2-tuning-ssl.md). As variantes do MT temporal herdam os do
+# metodo base (`mt-temporal-prev`); o `nomt` herda so o `temporal_weight` (o termo MT dele e 0 por definicao).
+ssl_hparams_file: configs/frozen/e2-ssl-hparams.yaml
+ssl_hparams_untuned: [supervised]
+ssl_hparams_from:
+  mt-temporal-bi:            {method: mt-temporal-prev}
+  mt-temporal-prev3:         {method: mt-temporal-prev}
+  mt-temporal-proto-teacher: {method: mt-temporal-prev}
+  mt-temporal-proto-student: {method: mt-temporal-prev}
+  mt-temporal-nomt:          {method: mt-temporal-prev, params: [temporal_weight]}
+
+training:
+  max_steps: 8000
+  val_every_n_steps: 500
+  labeled_batch_size: 8      
+  unlabeled_batch_size: 8
+  batch_size: 16              
+
+data:
+  split_file: configs/splits/inca-protocolo-s42.csv
+
+evaluation:
+  num_classes: 2
+  class_ids: {1: FG}
+  unm:
+    target: src.data.unm.VFSSUnmWindowImageDataset
+    params:
+      dataset_path: /data_ssd/caioseda/data/dataset_unm/
+      target_variant: binary_all
+      size: 256
+      window_size: 1
+      stride: 1
+      repeat_channels: True
+      mask_interpolation: nearest
+      split: null             # o UNM inteiro: nenhum frame dele foi visto no treino
+  num_workers: 8
+
+results_csv: results_per_sample.csv
+resources_csv: results_resources.csv

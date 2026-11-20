@@ -31,6 +31,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import pandas as pd
 import torch
+import yaml
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 
@@ -86,12 +87,62 @@ class E2Sweep(E1CVSweep):
             "unlabeled_policy": str(cell["unlabeled_policy"]),
             "seed": int(cell["seed"]),
         }}
+        lit_params = dict(self.ssl_hparams(cell))
         teacher = self.teacher_for(cell)
         if teacher is not None:
             teacher_run_id, checkpoint = teacher
-            overrides["lit_module"] = {"params": {"teacher_checkpoint": checkpoint,
-                                                  "teacher_run_id": teacher_run_id}}
+            lit_params.update({"teacher_checkpoint": checkpoint, "teacher_run_id": teacher_run_id})
+        if lit_params:
+            overrides["lit_module"] = {"params": lit_params}
         return overrides
+
+    # ------------------------------------------------------------------ frozen SSL hyperparameters
+
+    def _frozen_ssl_document(self) -> Dict[str, Any]:
+        path = resolve_project_path(str(self.config.ssl_hparams_file))
+        if not path.exists():
+            raise FileNotFoundError(
+                f"{path} não existe: os pesos dos métodos SSL ainda não foram congelados. Rode o tuning do E2 "
+                "(configs/sweep/e2-ssl-tuning-search.yaml e e2-ssl-tuning-confirm.yaml, ver "
+                "docs/e2-tuning-ssl.md) e scripts/freeze_e2_ssl_hparams.py antes."
+            )
+        return yaml.safe_load(path.read_text())
+
+    def ssl_hparams(self, cell: Dict[str, Any]) -> Dict[str, Any]:
+        '''
+        Pesos congelados pelo tuning do E2 para o método da célula (`ssl_hparams_file`), ou {} quando o sweep
+        não declara o arquivo -- o caso do `e2.yaml`/`e2-cv.yaml`, que seguem com os pesos dos YAMLs base.
+
+        `ssl_hparams_from: {variante: {method: base, params: [...]}}` faz uma variante herdar os pesos do
+        método base (só os listados em `params`, se houver); `ssl_hparams_untuned` lista os métodos sem peso
+        não supervisionado (o supervisionado). Qualquer outro método sem entrada é recusado, em vez de rodar
+        silenciosamente com o peso padrão.
+        '''
+        if not self.config.get("ssl_hparams_file"):
+            return {}
+        method, arch = str(cell["method"]), str(cell["arch"])
+        untuned = [str(m) for m in (self.config.get("ssl_hparams_untuned") or [])]
+        if method in untuned:
+            return {}
+        mappings = self.config.get("ssl_hparams_from")
+        mappings = OmegaConf.to_container(mappings, resolve=True) if OmegaConf.is_config(mappings) else (mappings or {})
+        mapping = mappings.get(method) or {}
+        source = str(mapping.get("method", method))
+        frozen = self._frozen_ssl_document()["hparams"]
+        if arch not in frozen or source not in frozen[arch]:
+            raise KeyError(
+                f"{self.config.ssl_hparams_file} não tem pesos para arch='{arch}', method='{source}'"
+                + (f" (herdados por '{method}')" if source != method else "")
+                + ". Declare o método em `ssl_hparams_untuned` ou `ssl_hparams_from` se for o caso."
+            )
+        params = dict(frozen[arch][source]["params"])
+        keys = mapping.get("params")
+        if keys is not None:
+            missing = set(keys) - set(params)
+            if missing:
+                raise KeyError(f"'{source}' não tem os pesos {sorted(missing)} pedidos por '{method}'.")
+            params = {key: params[key] for key in keys}
+        return params
 
     # ------------------------------------------------------------------ two-stage methods
 
@@ -105,6 +156,14 @@ class E2Sweep(E1CVSweep):
         except FileNotFoundError:
             return {"cells": {}}
 
+    def teacher_sibling(self, cell: Dict[str, Any], teacher_method: str) -> Dict[str, Any]:
+        '''A célula que é a etapa 1 de `cell`: a mesma, com `method` trocado. O tuning (e2_tuning.py) troca.'''
+        return {**cell, "method": teacher_method}
+
+    def teacher_state(self) -> Dict[str, Any]:
+        '''O `state.json` onde a etapa 1 está registrada: o do próprio sweep (ou shard).'''
+        return self._sweep_state()
+
     def teacher_for(self, cell: Dict[str, Any]) -> Optional[Tuple[str, str]]:
         '''
         `(run_id, best_checkpoint_path)` da célula que é a etapa 1 desta, ou None se o método tem uma etapa
@@ -114,9 +173,8 @@ class E2Sweep(E1CVSweep):
         teacher_method = self._teacher_methods().get(str(cell["method"]))
         if teacher_method is None:
             return None
-        sibling = {**cell, "method": teacher_method}
-        run_id = self.run_id(sibling)
-        entry = self._sweep_state().get("cells", {}).get(run_id, {})
+        run_id = self.run_id(self.teacher_sibling(cell, teacher_method))
+        entry = self.teacher_state().get("cells", {}).get(run_id, {})
         checkpoint = entry.get("best_checkpoint_path")
         if entry.get("status") != "done" or not checkpoint or not Path(checkpoint).exists():
             raise RuntimeError(
@@ -208,7 +266,7 @@ class E2Sweep(E1CVSweep):
         teacher_method = self._teacher_methods().get(str(cell["method"]))
         if teacher_method is None:
             return {}
-        teacher_run_id = self.run_id({**cell, "method": teacher_method})
+        teacher_run_id = self.run_id(self.teacher_sibling(cell, teacher_method))
         costs: Dict[str, Any] = {"teacher_run_id": teacher_run_id}
         rows = resources[resources.run_id == teacher_run_id] if "run_id" in resources.columns else resources.iloc[:0]
         for key in self.STAGE1_COST_KEYS:

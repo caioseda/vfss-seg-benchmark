@@ -20,9 +20,15 @@ Um sweep dividido (1-indexado; cada fold/seed inteiro fica numa GPU so):
 
 Acompanhar e juntar:
     python scripts/remote.py status                             # containers, GPU e disco de cada host
+    python scripts/remote.py progress dl05 configs/sweep/e2-cv.yaml  # feitas/faltam, tempo e ETA (so leitura)
     python scripts/remote.py logs dl05 configs/sweep/e2-cv.yaml # console ao vivo (Ctrl-C so para de olhar)
     python scripts/remote.py sync --family e2-cv --every 300    # em tmux: puxa os logs a cada 5 min
     python scripts/remote.py merge configs/sweep/e2-cv.yaml     # CSVs dos shards -> CSV canonica
+
+Retreinar SO algumas celulas ja concluidas (ex.: um metodo com bug), arquivando as velhas:
+    python scripts/invalidate_cells.py --config configs/sweep/e2-cv.yaml --set "axes.method=[fixmatch]" --label <rotulo>
+    python scripts/remote.py invalidate dl05 configs/sweep/e2-cv.yaml --set "axes.method=[fixmatch]" --label <rotulo>
+    python scripts/remote.py submit dl05 configs/sweep/e2-cv.yaml --set "axes.method=[fixmatch]"
     python scripts/index_runs.py --backend mlflow               # runs remotos no MLflow da delaunay
     tensorboard --logdir logs/e2-cv --host 127.0.0.1 --port 6006
 
@@ -216,7 +222,8 @@ def cmd_submit(args, runner: Runner, config: dict) -> int:
         if usage > 0.9 * host.quota_gb:
             print(f"aviso: {host.root} em {host.name} usa {usage:.1f} GB de {host.quota_gb:g} GB.")
         print(f"retrato do codigo -> {host.name}:{host.root}/code/{name}/")
-        runner.script(host, f"umask 0002; mkdir -p {shlex.quote(f'{host.root}/code/{name}')}\n")
+        runner.script(host, "umask 0002; mkdir -p "
+                      + " ".join(shlex.quote(path) for path in remote.snapshot_dirs(host, name, config)) + "\n")
         runner.local(remote.rsync_code_command(host, name))
         for command in remote.rsync_deps_commands(host, name, config):
             runner.local(command)
@@ -299,6 +306,44 @@ def cmd_merge(args, runner: Runner, config: dict) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------- invalidar
+
+def cmd_invalidate(args, runner: Runner, config: dict) -> int:
+    """
+    Arquiva, NO HOST, os runs e as entradas de shard das celulas recortadas por --set (ver
+    scripts/invalidate_cells.py, que faz o mesmo na delaunay). Sem isso o proximo `sync` traria de volta os
+    runs velhos e o `state.json`/CSVs do shard, e um `submit` no host pularia as celulas ("ja na CSV").
+    """
+    from src.sweep import archive_label, invalidation_targets
+
+    host = get_host(args.host, config)
+    config_rel = _relative_config(args.config)
+    targets = invalidation_targets(config_rel, args.set)
+    label = archive_label(targets["family"], args.label)
+    if host.local:
+        return _fail("na delaunay os logs sao os do repositorio: use scripts/invalidate_cells.py.")
+    state = runner.script(host, remote.container_state_script(remote.container_name(config_rel, args.tag or host.name)),
+                          check=False, capture=True)
+    status = (state.stdout or "").strip() or "absent"
+    if status in {"running", "restarting", "paused"} and not args.force:
+        return _fail(f"o container deste sweep esta '{status}' em {host.name}; pare-o antes (ou use --force).")
+    kwargs = {**remote.invalidate_paths(host, label), "family": targets["family"],
+              "run_ids": targets["run_ids"], "run_names": targets["run_names"], "reason": args.reason,
+              "dry_run": bool(args.invalidate_dry_run), "force": bool(args.force)}
+    print(f"{host.name}: celulas {', '.join(targets['run_ids'])}")
+    done = runner.script(host, remote.invalidate_script(kwargs), check=False, capture=True,
+                         display=f"python3 - <src/sweep_invalidate.py> '<{len(targets['run_ids'])} run_ids, "
+                                 f"logs_root={kwargs['logs_root']}, dry_run={kwargs['dry_run']}>'")
+    output = done.stdout or ""
+    print("\n".join(line for line in output.splitlines() if not line.startswith("REPORT ")))
+    if done.stderr:
+        print(done.stderr, file=sys.stderr)
+    if done.returncode == 0 and not args.invalidate_dry_run and not runner.dry_run:
+        print(f"\nproximo passo: python scripts/remote.py submit {host.name} {config_rel} --set "
+              + " ".join(shlex.quote(item) for item in args.set))
+    return done.returncode
+
+
 # ---------------------------------------------------------------------- acompanhar
 
 def _resolve_name(host, target: str, tag) -> str:
@@ -314,6 +359,68 @@ def cmd_status(args, runner: Runner, config: dict) -> int:
         runner.script(host, remote.status_script(host), check=False)
         print()
     return 0
+
+
+def _fmt_s(seconds) -> str:
+    if seconds is None:
+        return "?"
+    minutes = int(seconds // 60)
+    return f"{minutes // 60}h{minutes % 60:02d}" if minutes >= 60 else f"{minutes}min"
+
+
+def _progress_once(args, runner: Runner, config: dict) -> int:
+    '''Celulas concluidas, tempo decorrido, quantas faltam e ETA de um sweep, lidos por SSH (so leitura).'''
+    from datetime import datetime, timedelta
+    from src.sweep import Sweep
+    host = get_host(args.host, config)
+    config_rel = _relative_config(args.config)
+    tag = args.tag or host.name
+    sweep = Sweep(config_rel)
+    planned = [{"run_id": sweep.plan.run_id(c), **c} for c in sweep.cells()]
+    name = remote.container_name(config_rel, tag)
+    done = runner.script(host, remote.progress_script(host, name, sweep.family_dir.name, tag), check=False, capture=True)
+    if runner.dry_run:
+        return 0
+    info = remote.parse_progress(done.stdout or "")
+    if not info["now"]:
+        return _fail(f"sem resposta de {host.name}.")
+    now = datetime.fromisoformat(info["now"])
+    started = None
+    if info["container"]:
+        # StartedAt e UTC; o relogio do host pode nao ser. Converte pela diferenca entre os dois relogios.
+        status, _, raw = info["container"].partition(" ")
+        raw_started = datetime.fromisoformat(raw.split(".")[0])
+        started = raw_started
+    else:
+        status = "ausente"
+    cells = info["state"].get("cells", {})
+    stamps = [datetime.fromisoformat(e["updated_at"]) for e in cells.values() if e.get("updated_at")]
+    if started is not None and stamps and abs((started - min(stamps)).total_seconds()) > 86400:
+        started = None   # fusos diferentes ou container recriado: nao usa a ancora
+    summary = remote.summarize_progress(info["state"], planned, now, started)
+    print(f"{host.name}  container {name}: {status}")
+    print(f"  concluidas {summary['done']}/{summary['total']}   rodando {summary['running'] or '-'}"
+          f"   faltam {summary['pending']}")
+    if summary["running"]:
+        print(f"  celula atual ha {_fmt_s(summary['running_elapsed_s'])}")
+    print(f"  tempo decorrido {_fmt_s(summary['elapsed_s'])}   media por celula {_fmt_s(summary['mean_cell_s'])}")
+    if summary["eta_s"] is not None:
+        print(f"  ETA {_fmt_s(summary['eta_s'])} (termina ~{(now + timedelta(seconds=summary['eta_s'])).strftime('%d/%m %H:%M')}"
+              f", UTC)")
+    return 0
+
+
+def cmd_progress(args, runner: Runner, config: dict) -> int:
+    if not args.watch:
+        return _progress_once(args, runner, config)
+    try:
+        while True:
+            print(f"\n[{time.strftime('%H:%M:%S')}]")
+            _progress_once(args, runner, config)
+            time.sleep(args.watch)
+    except KeyboardInterrupt:
+        print("\nParei de ACOMPANHAR. O container segue treinando.")
+        return 0
 
 
 def cmd_logs(args, runner: Runner, config: dict) -> int:
@@ -372,8 +479,25 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("target", help="configs/sweep/*.yaml ou o nome da familia")
     p.add_argument("--dry-run", action="store_true", dest="merge_dry_run")
 
+    p = sub.add_parser("invalidate", help="arquiva no host os runs/estado de celulas a retreinar (ver invalidate_cells.py)")
+    p.add_argument("host")
+    p.add_argument("config", help="configs/sweep/*.yaml")
+    p.add_argument("--set", nargs="+", required=True, metavar="CHAVE=VALOR",
+                   help="recorte da grade (ex.: \"axes.method=[fixmatch]\")")
+    p.add_argument("--label", required=True, help="rotulo do arquivo (o mesmo do invalidate_cells.py)")
+    p.add_argument("--reason", default="")
+    p.add_argument("--tag", default=None, help="tag do shard/container (padrao: o nome do host)")
+    p.add_argument("--dry-run", action="store_true", dest="invalidate_dry_run", help="so mostra o que sairia")
+    p.add_argument("--force", action="store_true", help="ignora container rodando / celulas `running`")
+
     p = sub.add_parser("status", help="containers, GPU e disco de cada host")
     p.add_argument("hosts", nargs="*")
+
+    p = sub.add_parser("progress", help="celulas feitas/faltando, tempo e ETA de um sweep num host (so leitura)")
+    p.add_argument("host")
+    p.add_argument("config", help="configs/sweep/*.yaml")
+    p.add_argument("--tag", default=None)
+    p.add_argument("--watch", type=int, default=None, metavar="SEG", help="repete a cada SEG segundos")
 
     for command, text in (("logs", "console do container ao vivo"), ("stop", "para o container")):
         p = sub.add_parser(command, help=text)
@@ -393,7 +517,7 @@ def main(argv=None) -> int:
     runner = Runner(dry_run=args.dry_run)
     config = load_hosts(Path(args.hosts_file))
     handler = {"lock": cmd_lock, "build": cmd_build, "setup": cmd_setup, "submit": cmd_submit, "sync": cmd_sync,
-               "merge": cmd_merge, "status": cmd_status, "logs": cmd_logs, "stop": cmd_stop}[args.command]
+               "merge": cmd_merge, "invalidate": cmd_invalidate, "status": cmd_status, "progress": cmd_progress, "logs": cmd_logs, "stop": cmd_stop}[args.command]
     try:
         return handler(args, runner, config)
     except (FileNotFoundError, KeyError, ValueError) as error:

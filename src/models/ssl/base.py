@@ -95,6 +95,18 @@ class SemiSupervisedLitWrapper(LitWrapper):
     # sees the same geometry) or `labeled` (FixMatch: its unlabeled rows already get their own
     # weak/strong views, and augmenting them here would stack two weak draws).
     student_augment_rows = "all"
+    # Which rows go through the shared step's student forward (the one the supervised term uses):
+    # `all` (every row -- the unsupervised term of Mean Teacher & co. reads the unlabeled logits from it)
+    # or `labeled` (FixMatch, whose unsupervised term makes its own weak/strong forwards and never reads
+    # the unlabeled logits of this one).
+    #
+    # `labeled` is not an optimisation, it is a correctness requirement whenever the two halves of the
+    # batch are distinguishable (`student_augment_rows = "labeled"`): with 8 augmented labeled rows and
+    # 8 RAW unlabeled rows that carry no loss in one train-mode BatchNorm batch, the network learns to
+    # use the raw subgroup as a sink for the batch statistics, and in eval every raw INCA image falls in
+    # that regime -- the E2 FixMatch predicted "all foreground" on INCA (val Dice ~0.05) while training
+    # Dice was 0.90 (diagnosis 2026-11-17; pinned by tests/test_e2_aug.py).
+    main_forward_rows = "all"
 
     def __init__(
         self,
@@ -277,7 +289,9 @@ class SemiSupervisedLitWrapper(LitWrapper):
 
         Args:
             batch: the raw batch (subclasses that need a second forward pass re-read `batch['image']`).
-            logits: `self.forward(batch['image'])`, already computed for the supervised term.
+            logits: the shared step's student forward, already computed for the supervised term:
+                `self.forward(batch['image'])` with `main_forward_rows = "all"`, or only the labeled
+                rows (None if there are none) with `main_forward_rows = "labeled"`.
             is_labeled: `[B]` bool mask.
         '''
         raise NotImplementedError("Subclasses of SemiSupervisedLitWrapper must implement unsupervised_loss.")
@@ -372,6 +386,7 @@ class SemiSupervisedLitWrapper(LitWrapper):
         logits: Tensor,
         targets: Tensor,
         extra: Optional[Dict[str, Tensor]] = None,
+        logits_rows: str = "all",
     ) -> None:
         '''
         The training-time log block, shared by every subclass.
@@ -384,20 +399,26 @@ class SemiSupervisedLitWrapper(LitWrapper):
         Args:
             extra: additional `{key: scalar}` logged with the same on_epoch reduction. Keys are
                 used verbatim, so they must already carry the `train/` prefix.
+            logits_rows: `all` -- `logits` is aligned with the whole batch (`is_labeled`); `labeled` --
+                `logits` holds only the labeled rows, in order (or is None when there are none), as
+                produced by `main_forward_rows = "labeled"`. `targets` is always the whole batch.
         '''
         log_dict = {
             "train/loss": loss,
             "train/sup_loss": sup_loss,
             "train/unsup_loss": unsup_loss,
             "train/unsup_loss_weighted": weight * unsup_loss,
-            "train/consistency_weight": torch.tensor(weight, device=logits.device),
+            "train/consistency_weight": torch.tensor(weight, device=loss.device),
             "train/labeled_in_batch": is_labeled.sum().float(),
             "train/unlabeled_in_batch": (~is_labeled).sum().float(),
         }
         if extra:
             log_dict.update(extra)
-        if is_labeled.any():
-            for name, value in self.compute_metrics(logits[is_labeled], targets[is_labeled], stage="train").items():
+        if logits_rows not in ("all", "labeled"):
+            raise ValueError(f"logits_rows deve ser 'all' ou 'labeled', recebeu '{logits_rows}'")
+        if is_labeled.any() and logits is not None:
+            labeled_logits = logits if logits_rows == "labeled" else logits[is_labeled]
+            for name, value in self.compute_metrics(labeled_logits, targets[is_labeled], stage="train").items():
                 log_dict[f"train/{name}"] = value
 
         self.log("step", float(self.global_step), prog_bar=True, logger=True, on_step=True, on_epoch=False)
@@ -456,14 +477,25 @@ class SemiSupervisedLitWrapper(LitWrapper):
         images, targets = batch["image"], batch["segmentation"]
         is_labeled = self.labeled_mask(batch).to(images.device)
 
-        logits = self.forward(images)
-        self.count_forward("student", images.shape[0])
-
-        if is_labeled.any():
-            sup_loss = self.supervised_loss(logits[is_labeled], targets[is_labeled])
+        if self.main_forward_rows == "labeled":
+            # `logits` covers ONLY the labeled rows (see `main_forward_rows`).
+            if is_labeled.any():
+                logits = self.forward(images[is_labeled])
+                self.count_forward("student", logits.shape[0])
+                sup_loss = self.supervised_loss(logits, targets[is_labeled])
+            else:
+                # No labeled row: no student forward at all here (forwarding the raw unlabeled rows would
+                # bring the BN sink back). A zero tied to the parameters keeps the loss differentiable.
+                logits = None
+                sup_loss = sum(param.sum() for param in self.model.parameters()) * 0.0
         else:
-            # Can only happen if a batch is drawn entirely from the unlabeled stream.
-            sup_loss = logits.sum() * 0.0
+            logits = self.forward(images)
+            self.count_forward("student", images.shape[0])
+            if is_labeled.any():
+                sup_loss = self.supervised_loss(logits[is_labeled], targets[is_labeled])
+            else:
+                # Can only happen if a batch is drawn entirely from the unlabeled stream.
+                sup_loss = logits.sum() * 0.0
 
         weight = self.current_consistency_weight()
         if weight > 0.0 and (~is_labeled).any():
@@ -471,8 +503,9 @@ class SemiSupervisedLitWrapper(LitWrapper):
         else:
             # No unlabeled rows in the batch, or still in warm-up: the method degenerates to its
             # supervised baseline for this step.
-            unsup_loss = logits.sum() * 0.0
+            unsup_loss = sup_loss * 0.0
 
         loss = sup_loss + weight * unsup_loss
-        self.log_training(loss, sup_loss, unsup_loss, weight, is_labeled, logits, targets)
+        self.log_training(loss, sup_loss, unsup_loss, weight, is_labeled, logits, targets,
+                          logits_rows=self.main_forward_rows)
         return loss

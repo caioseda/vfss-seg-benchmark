@@ -113,6 +113,12 @@ def deps_dir(host: "Host", name: str, index: int) -> str:
     return f"{host.root}/code/{name}.deps/{index}"
 
 
+def snapshot_dirs(host: "Host", name: str, config: Optional[dict] = None) -> List[str]:
+    '''Destinos do rsync do retrato. Precisam existir antes: o rsync so cria o ULTIMO nivel do destino.'''
+    return [f"{host.root}/code/{name}"] + [deps_dir(host, name, index)
+                                           for index in range(len(python_paths(config)))]
+
+
 # ---------------------------------------------------------------------- imagem
 
 def image_tag(config: Optional[dict] = None) -> str:
@@ -266,7 +272,9 @@ def rsync_deps_commands(host: Host, name: str, config: Optional[dict] = None) ->
 
 
 def rsync_data_command(host: Host, dataset: str, config: Optional[dict] = None) -> List[str]:
-    return ["rsync", "-a", "--info=progress2", f"{data_path(config)}/{dataset}/",
+    # --no-inc-recursive: lista tudo antes de copiar, senao o total do progress2 cresce
+    # durante a copia e a porcentagem sobe/desce.
+    return ["rsync", "-a", "--no-inc-recursive", "--info=progress2", f"{data_path(config)}/{dataset}/",
             host.remote_path(f"{host.root}/data/{dataset}/")]
 
 
@@ -326,6 +334,93 @@ def status_script(host: Host) -> str:
     ]) + "\n"
 
 
+def progress_script(host: Host, name: str, family: str, tag: str) -> str:
+    '''Le (so leitura) o state.json do shard, o inicio do container e o relogio do host.'''
+    q = shlex.quote
+    state = f"{host.root}/logs/{family}/_sweep/{tag}/state.json"
+    return "\n".join([
+        f"echo \"NOW $(date -u +%Y-%m-%dT%H:%M:%S)\"",
+        f"echo \"CONTAINER $(docker inspect {q(name)} --format '{{{{.State.Status}}}} {{{{.State.StartedAt}}}}' 2>/dev/null)\"",
+        f"echo STATE; cat {q(state)} 2>/dev/null || echo '{{}}'",
+    ]) + "\n"
+
+
+def parse_progress(output: str) -> dict:
+    '''Inverte `progress_script`: {"now": str, "container": str, "state": dict}.'''
+    import json
+    lines = output.splitlines()
+    now = next((l.split(" ", 1)[1] for l in lines if l.startswith("NOW ")), "")
+    container = next((l.split(" ", 1)[1] for l in lines if l.startswith("CONTAINER ")), "").strip()
+    body = "\n".join(lines[lines.index("STATE") + 1:]) if "STATE" in lines else "{}"
+    try:
+        state = json.loads(body)
+    except ValueError:
+        state = {}
+    return {"now": now, "container": container, "state": state}
+
+
+def summarize_progress(state: dict, planned: Sequence[dict], now, started=None) -> dict:
+    '''
+    Contagens e ETA de um shard. `planned` = [{"run_id", "method"?}] na ordem da grade; `now`/`started`
+    sao datetimes no MESMO fuso do `updated_at` do state (o relogio do host). A duracao de uma celula e a
+    diferenca entre os `updated_at` de celulas consecutivas (a primeira parte de `started`); o ETA usa a
+    media do MESMO metodo, ja que supervised leva 12 min e dtc-trus 25.
+    '''
+    from datetime import datetime
+    cells = state.get("cells", {})
+    stamp = lambda e: datetime.fromisoformat(e["updated_at"])
+    done = sorted((rid for rid, e in cells.items() if e.get("status") == "done"), key=lambda r: stamp(cells[r]))
+    methods = {c["run_id"]: c.get("method") for c in planned}
+    durations, previous = {}, started
+    for rid in done:
+        finished = stamp(cells[rid])
+        if previous is not None and finished > previous:
+            durations[rid] = (finished - previous).total_seconds()
+        previous = finished
+    overall = sum(durations.values()) / len(durations) if durations else None
+
+    def estimate(rid):
+        same = [d for r, d in durations.items() if methods.get(r) == methods.get(rid) and methods.get(rid)]
+        return sum(same) / len(same) if same else overall
+
+    running = next((rid for rid, e in cells.items() if e.get("status") == "running"), None)
+    pending = [c["run_id"] for c in planned if c["run_id"] not in done and c["run_id"] != running]
+    eta, known = 0.0, overall is not None
+    if running:
+        elapsed = (now - stamp(cells[running])).total_seconds()
+        est = estimate(running)
+        eta += max(est - elapsed, 0.0) if est else 0.0
+    eta += sum(estimate(r) or 0.0 for r in pending)
+    return {"total": len(planned), "done": len(done), "running": running,
+            "running_elapsed_s": (now - stamp(cells[running])).total_seconds() if running else None,
+            "pending": len(pending), "mean_cell_s": overall,
+            "elapsed_s": (now - started).total_seconds() if started else None,
+            "eta_s": eta if known else None}
+
+
+INVALIDATE_MODULE = PROJECT_ROOT / "src" / "sweep_invalidate.py"
+# Fora de `logs/` de proposito: o sync puxa `logs/` inteiro, e o arquivo de um host voltaria para a delaunay
+# por cima do arquivo local (que ja tem os mesmos runs, com checkpoints).
+REMOTE_ARCHIVE_DIR = "arquivo"
+
+
+def invalidate_paths(host: Host, label: str) -> Dict[str, str]:
+    """`logs_root` e `archive_dir` de `src.sweep_invalidate.invalidate` num host remoto."""
+    return {"logs_root": f"{host.root}/logs", "archive_dir": f"{host.root}/{REMOTE_ARCHIVE_DIR}/{label}"}
+
+
+def invalidate_script(kwargs: dict) -> str:
+    """
+    Script bash que roda `src/sweep_invalidate.py` no host com o python3 do SISTEMA (o modulo so usa a
+    biblioteca padrao): o codigo vai inteiro pelo stdin, os argumentos como um JSON em argv[1].
+    """
+    source = INVALIDATE_MODULE.read_text()
+    marker = "VFSS_INVALIDATE_EOF"
+    if marker in source:
+        raise ValueError(f"{INVALIDATE_MODULE} contem o marcador {marker}")
+    return (f"python3 - {shlex.quote(json.dumps(kwargs))} <<'{marker}'\n{source}\n{marker}\n")
+
+
 def disk_usage_gb_script(host: Host) -> str:
     return f"du -sk {shlex.quote(host.root)} 2>/dev/null | cut -f1 || echo 0\n"
 
@@ -350,12 +445,15 @@ class Runner:
                               capture_output=capture)
 
     def script(self, host: Host, script: str, check: bool = True, capture: bool = False,
-               tty: bool = False) -> subprocess.CompletedProcess:
-        '''Roda um script bash no host: localmente na delaunay, por `ssh ... bash -s` num remoto.'''
+               tty: bool = False, display: Optional[str] = None) -> subprocess.CompletedProcess:
+        '''
+        Roda um script bash no host: localmente na delaunay, por `ssh ... bash -s` num remoto. `display`
+        substitui o script no eco (ex.: quando ele carrega um modulo Python inteiro).
+        '''
         command = ["bash", "-s"] if host.local else \
             ["ssh", "-o", "BatchMode=yes", *(["-t"] if tty else []), host.target, "bash", "-s"]
         where = "local" if host.local else host.target
-        self._show(f"[{where}] " + script.strip().replace("\n", "\n    "))
+        self._show(f"[{where}] " + (display or script).strip().replace("\n", "\n    "))
         if self.dry_run:
             return subprocess.CompletedProcess(command, 0, stdout="" if capture else None)
         return subprocess.run(command, input=script, text=True, check=check, capture_output=capture)

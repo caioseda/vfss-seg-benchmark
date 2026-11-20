@@ -1,0 +1,117 @@
+# E2 / tuning SSL, ETAPA 1 (busca) -- pesos das perdas nao supervisionadas, por metodo, no molde do
+# tuning A.1 do E1 (e1-tuning-search.yaml). Protocolo, justificativa e o que NAO e ajustado:
+# docs/e2-tuning-ssl.md. Logica: src/sweeps/e2_tuning.py (E2TuningSweep).
+#
+#   # fase 1: referencia (supervised = professor do DTC-TRUS) + MT, FixMatch, DTC-TRUS
+#   python scripts/run_sweep.py --config configs/sweep/e2-ssl-tuning-search.yaml --dry-run
+#   scripts/submit.sh configs/sweep/e2-ssl-tuning-search.yaml
+#   # (depois da confirmacao do Mean Teacher) fase 2: MT temporal, herdando o consistency_weight do MT
+#   python scripts/run_sweep.py --config configs/sweep/e2-ssl-tuning-search.yaml --set "axes.method=[mt-temporal-prev]"
+#
+# Treina SO no fold 0 do desenvolvimento (rotulos + pool nao rotulado SO desses videos), seleciona pelo
+# Dice medio por paciente na validacao fixa e nao carrega teste nenhum (nem INCA, nem UNM). lr/wd sao os do
+# E1. Um study por metodo, 25 trials de 4000 passos (T_max = 4000), mesmos sampler/pruner do E1.
+type: sweep
+name: e2-ssl-tuning-search
+family: e2-ssl-tuning-search
+plan: src.sweeps.e2_tuning.E2TuningSweep
+
+# `trial` nao entra aqui: vem de `search_space.n_trials`. Metodos sem espaco de busca (supervised) rodam uma
+# vez, pelo cronograma completo (`training.reference_max_steps`), antes dos trials.
+axes:
+  seed: [42]
+  arch: [deeplabv3plus]
+  unlabeled_policy: [global]
+  method: [supervised, meanteacher, fixmatch, dtc-trus]
+
+base_configs:
+  supervised:       configs/experiment/e2/e2-supervised.yaml
+  fixmatch:         configs/experiment/e2/e2-fixmatch.yaml
+  meanteacher:      configs/experiment/e2/e2-meanteacher.yaml
+  mt-temporal-prev: configs/experiment/e2/e2-mt-temporal-prev.yaml
+  dtc-trus:         configs/experiment/e2/e2-dtc-trus.yaml
+
+# A etapa 1 do DTC-TRUS e a celula de referencia `supervised` (fold 0, 8000 passos): o MESMO professor em
+# todos os trials da busca e da confirmacao.
+teacher_from:
+  dtc-trus: supervised
+
+arch_configs:
+  unet:          configs/experiment/e1/e1-unet.yaml
+  unetplusplus:  configs/experiment/e1/e1-unetplusplus.yaml
+  fpn:           configs/experiment/e1/e1-fpn.yaml
+  deeplabv3plus: configs/experiment/e1/e1-deeplabv3plus.yaml
+  swinunet_tiny: configs/experiment/e1/e1-swinunet-tiny.yaml
+
+hparams_file: configs/frozen/e1-hparams.yaml
+
+# Regra do espaco (igual para todos): log-uniforme de valor_atual/10 a valor_atual*10 (2 decadas, como
+# lr/wd no E1). Excecao declarada: o teto de proto_weight sobe para 3 para conter o ponto do artigo.
+# Trial 0 = valores atuais do E2; o 2o ponto fixo, quando existe, e o valor publicado (do mesmo orcamento).
+# A ORDEM das chaves em `params` faz parte da semente (o sampler sorteia nessa ordem).
+search_space:
+  n_trials: 25
+  methods:
+    meanteacher:
+      params:
+        consistency_weight: {low: 0.01, high: 1.0, log: true}
+      fixed_trials:
+        - {consistency_weight: 0.1}
+    fixmatch:
+      params:
+        consistency_weight: {low: 0.01, high: 1.0, log: true}        # lambda_u
+      fixed_trials:
+        - {consistency_weight: 0.1}
+        - {consistency_weight: 1.0}                                   # Sohn et al. 2020
+    mt-temporal-prev:
+      # Incremental: o termo MT fica no valor que a confirmacao escolheu para o Mean Teacher; so o termo
+      # temporal e ajustado. A diferenca MT temporal - MT isola a contribuicao do termo temporal.
+      inherit:
+        consistency_weight: meanteacher
+      params:
+        temporal_weight: {low: 0.01, high: 1.0, log: true}
+      fixed_trials:
+        - {temporal_weight: 0.1}
+    dtc-trus:
+      # seg_weight = 3 fica como referencia de escala (AdamW ~ invariante a escala global da perda).
+      params:
+        kd_weight:    {low: 0.1,  high: 10.0, log: true}
+        con_weight:   {low: 0.2,  high: 20.0, log: true}
+        proto_weight: {low: 0.01, high: 3.0,  log: true}
+      fixed_trials:
+        - {kd_weight: 1.0, con_weight: 2.0, proto_weight: 0.1}       # codigo original (3/1/2/0,1)
+        - {kd_weight: 3.0, con_weight: 0.75, proto_weight: 3.0}      # artigo (1/1/0,25/1), reescalado p/ seg=3
+
+# De onde a fase 2 le os pesos herdados (o vencedor da confirmacao do metodo de origem).
+inherit_from: configs/sweep/e2-ssl-tuning-confirm.yaml
+
+optuna:
+  monitor: val/dice_patient
+  sampler:
+    seed: 42
+    n_startup_trials: 10
+    multivariate: true
+  pruner:
+    n_startup_trials: 5
+    n_warmup_steps: 1000
+    interval_steps: 1
+
+training:
+  max_steps: 4000             # trials (e T_max do cosseno), como no E1
+  reference_max_steps: 8000   # celulas de referencia (supervised): o professor do DTC-TRUS no regime final
+  val_every_n_steps: 500
+  labeled_batch_size: 8
+  unlabeled_batch_size: 8
+  batch_size: 16
+
+data:
+  split_file: configs/splits/inca-protocolo-s42.csv
+  train_folds: [0]
+
+evaluation:
+  num_classes: 2
+  class_ids: {1: FG}
+  num_workers: 8
+
+results_csv: results_per_sample.csv
+resources_csv: results_resources.csv

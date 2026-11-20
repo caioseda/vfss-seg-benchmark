@@ -167,6 +167,69 @@ class TestMethodsWiring(unittest.TestCase):
         self.assertTrue(torch.equal(out["image"][~labeled], batch["image"][~labeled]))
         self.assertFalse(torch.equal(out["image"][labeled], batch["image"][labeled]))
 
+    def _record_forward_rows(self, module):
+        '''Envolve `module.forward` e devolve a lista de tamanhos de lote de cada chamada, em ordem.'''
+        calls = []
+        original = module.forward
+
+        def spy(images):
+            calls.append(images.shape[0])
+            return original(images)
+        module.forward = spy
+        return calls
+
+    def test_fixmatch_main_forward_sees_only_labeled_rows_with_augmentation(self):
+        '''
+        A regressão do E2 (2026-11-17): rotulados aumentados + não rotulados CRUS no mesmo forward em modo
+        train fazem a rede usar o grupo cru como dreno do BN, e em eval toda imagem crua vira "tudo FG".
+        Com `student_augment` ligado o forward principal é só dos rotulados (weight 0: nenhum outro forward).
+        '''
+        module = build(FixMatchLitWrapper, student_augment="weak", consistency_warmup_fraction=0.5)
+        module.log = module.log_dict = lambda *a, **k: None
+        self.assertEqual(module.main_forward_rows, "labeled")
+        batch = make_batch(n_labeled=2, n_unlabeled=3, size=16)
+        calls = self._record_forward_rows(module)
+        with mock.patch.object(type(module), "global_step", new_callable=mock.PropertyMock, return_value=0):
+            loss = module.training_step(batch, 0)
+        self.assertEqual(calls, [2])
+        loss.backward()
+        self.assertTrue(any(p.grad is not None and p.grad.abs().sum() > 0 for p in module.model.parameters()))
+
+    def test_fixmatch_unlabeled_rows_only_in_weak_and_strong_forwards(self):
+        '''Depois do warm-up: rotulados (2), weak dos não rotulados (3, sem grad), strong (3). Nada cru.'''
+        module = build(FixMatchLitWrapper, student_augment="weak", consistency_warmup_fraction=0.0,
+                       confidence_threshold=0.0)
+        module.log = module.log_dict = lambda *a, **k: None
+        batch = make_batch(n_labeled=2, n_unlabeled=3, size=16)
+        calls = self._record_forward_rows(module)
+        with mock.patch.object(type(module), "global_step", new_callable=mock.PropertyMock, return_value=900):
+            loss = module.training_step(batch, 0)
+        self.assertEqual(calls, [2, 3, 3])
+        self.assertTrue(torch.isfinite(loss))
+        loss.backward()
+
+    def test_fixmatch_without_augmentation_keeps_the_whole_batch_forward(self):
+        '''Sem aug (X1) as metades têm a mesma distribuição: o comportamento histórico fica.'''
+        module = build(FixMatchLitWrapper, student_augment="none", consistency_warmup_fraction=0.5)
+        module.log = module.log_dict = lambda *a, **k: None
+        self.assertEqual(module.main_forward_rows, "all")
+        batch = make_batch(n_labeled=2, n_unlabeled=3, size=16)
+        calls = self._record_forward_rows(module)
+        with mock.patch.object(type(module), "global_step", new_callable=mock.PropertyMock, return_value=0):
+            module.training_step(batch, 0)
+        self.assertEqual(calls, [5])
+
+    def test_fixmatch_batch_without_labeled_rows_stays_differentiable(self):
+        module = build(FixMatchLitWrapper, student_augment="weak", consistency_warmup_fraction=0.5)
+        module.log = module.log_dict = lambda *a, **k: None
+        batch = make_batch(n_labeled=0, n_unlabeled=3, size=16)
+        calls = self._record_forward_rows(module)
+        with mock.patch.object(type(module), "global_step", new_callable=mock.PropertyMock, return_value=0):
+            loss = module.training_step(batch, 0)
+        self.assertEqual(calls, [])
+        self.assertEqual(loss.item(), 0.0)
+        loss.backward()
+
     def test_temporal_augments_neighbors_flow_and_confidence(self):
         module = build(TemporalMeanTeacherLitWrapper, student_augment="weak")
         batch = make_batch(n_labeled=2, n_unlabeled=2, size=16)

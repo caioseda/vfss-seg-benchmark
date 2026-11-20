@@ -1,0 +1,61 @@
+# E2 / tuning SSL, ETAPA 2 (confirmacao) -- as 3 melhores configuracoes de cada metodo na busca, por 8000
+# passos, sem pruning, no mesmo fold 0 e com a mesma validacao fixa (molde: e1-tuning-confirm.yaml).
+# Protocolo: docs/e2-tuning-ssl.md. Logica: src/sweeps/e2_tuning.py (E2TuningConfirmSweep).
+#
+#   scripts/submit.sh configs/sweep/e2-ssl-tuning-confirm.yaml                                  # fase 1
+#   python scripts/run_sweep.py --config configs/sweep/e2-ssl-tuning-confirm.yaml --set "axes.method=[mt-temporal-prev]"   # fase 2
+#   python scripts/freeze_e2_ssl_hparams.py                                                    # congela
+#
+# So roda com a busca do metodo COMPLETA. O vencedor de cada metodo (maior Dice medio por paciente na
+# validacao entre as 3) e congelado em configs/frozen/e2-ssl-hparams.yaml, lido por e2-tuned.yaml e
+# e2-cv-tuned.yaml. O DTC-TRUS usa como professor a celula de referencia `supervised` da BUSCA.
+type: sweep
+name: e2-ssl-tuning-confirm
+family: e2-ssl-tuning-confirm
+plan: src.sweeps.e2_tuning.E2TuningConfirmSweep
+
+source_sweep: configs/sweep/e2-ssl-tuning-search.yaml
+top_k: 3
+
+axes:
+  seed: [42]
+  arch: [deeplabv3plus]
+  unlabeled_policy: [global]
+  method: [meanteacher, fixmatch, dtc-trus]
+
+base_configs:
+  fixmatch:         configs/experiment/e2/e2-fixmatch.yaml
+  meanteacher:      configs/experiment/e2/e2-meanteacher.yaml
+  mt-temporal-prev: configs/experiment/e2/e2-mt-temporal-prev.yaml
+  dtc-trus:         configs/experiment/e2/e2-dtc-trus.yaml
+
+teacher_from:
+  dtc-trus: supervised
+
+arch_configs:
+  unet:          configs/experiment/e1/e1-unet.yaml
+  unetplusplus:  configs/experiment/e1/e1-unetplusplus.yaml
+  fpn:           configs/experiment/e1/e1-fpn.yaml
+  deeplabv3plus: configs/experiment/e1/e1-deeplabv3plus.yaml
+  swinunet_tiny: configs/experiment/e1/e1-swinunet-tiny.yaml
+
+hparams_file: configs/frozen/e1-hparams.yaml
+
+training:
+  max_steps: 8000
+  val_every_n_steps: 500
+  labeled_batch_size: 8
+  unlabeled_batch_size: 8
+  batch_size: 16
+
+data:
+  split_file: configs/splits/inca-protocolo-s42.csv
+  train_folds: [0]
+
+evaluation:
+  num_classes: 2
+  class_ids: {1: FG}
+  num_workers: 8
+
+results_csv: results_per_sample.csv
+resources_csv: results_resources.csv

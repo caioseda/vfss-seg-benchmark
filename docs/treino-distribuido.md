@@ -114,6 +114,22 @@ python scripts/index_runs.py --backend mlflow              # runs remotos no MLf
   banco sqlite não aceita escrita concorrente pela rede. O `index_runs.py` é idempotente e indexa os runs
   depois do sync.
 
+## Retreinar só algumas células
+
+Quando um bug afeta só um método (ex.: o FixMatch do E2, 2026-11-17), as células dele já estão "prontas"
+nas CSVs e no `state.json` e seriam puladas. Invalide-as na delaunay **e** em cada host que rodou a família
+(senão o próximo `sync` traz de volta os runs velhos e o estado do shard). Nada é apagado: vai para
+`logs/_arquivo/<familia>-<rotulo>/` na delaunay e `<root>/arquivo/<familia>-<rotulo>/` no host.
+
+```bash
+FM='axes.method=[fixmatch]'
+python scripts/invalidate_cells.py --config configs/sweep/e2-cv.yaml --set "$FM" --label fixmatch-bn-dreno --reason "..." --dry-run
+python scripts/invalidate_cells.py --config configs/sweep/e2-cv.yaml --set "$FM" --label fixmatch-bn-dreno --reason "..."
+python scripts/remote.py invalidate dl05 configs/sweep/e2-cv.yaml --set "$FM" --label fixmatch-bn-dreno --reason "..."
+python scripts/remote.py submit dl05 configs/sweep/e2-cv.yaml --set "$FM"     # só as células recortadas
+# depois: sync + merge como acima; os notebooks leem as CSVs canônicas e passam a mostrar o run novo
+```
+
 ## Limpeza no host
 
 Depois de `sync` e `merge`, os runs remotos já estão na delaunay. Para liberar espaço:

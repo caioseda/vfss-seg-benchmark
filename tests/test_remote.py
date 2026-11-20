@@ -120,6 +120,8 @@ class DockerRun(unittest.TestCase):
                 self.assertEqual(source, f"/local/fulano/vfss/code/{name}.deps/0")
                 (command,) = remote.rsync_deps_commands(host, name, HOSTS)
                 self.assertEqual(command[-1], f"fulano@Deeplearning05:/local/fulano/vfss/code/{name}.deps/0/")
+                # o rsync so cria o ultimo nivel: `<name>.deps/` tem de ser criado antes
+                self.assertIn(f"/local/fulano/vfss/code/{name}.deps/0", remote.snapshot_dirs(host, name, HOSTS))
 
     def test_container_name_is_docker_safe(self):
         self.assertEqual(remote.container_name("configs/sweep/e2-cv.yaml", "dl05"), "vfss-e2-cv-dl05")

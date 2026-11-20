@@ -161,7 +161,8 @@ class OptunaPruning(Callback):
 
 
 def rank_trials(per_sample_val: pd.DataFrame, by: Sequence[str] = ("arch",), trial_column: str = "trial",
-                metric: str = "dice", completed_only: bool = True) -> pd.DataFrame:
+                metric: str = "dice", completed_only: bool = True,
+                extra_columns: Optional[Sequence[str]] = None) -> pd.DataFrame:
     '''
     Um valor por trial, na regra de selecao do protocolo: Dice medio POR PACIENTE na validacao fixa
     (`aggregate_per_patient`), media sobre as classes reportadas e, se houver mais de uma, sobre as seeds.
@@ -169,11 +170,15 @@ def rank_trials(per_sample_val: pd.DataFrame, by: Sequence[str] = ("arch",), tri
 
     `completed_only` descarta os trials podados (coluna `pruned`): o valor deles e de um treino
     interrompido, e nao concorre com os que terminaram.
+
+    `extra_columns`: colunas constantes dentro de um trial que acompanham o resultado (o ponto do trial).
+    Padrao: `lr`/`weight_decay` (o tuning do E1); o do E2 passa as colunas `hp_*` dos pesos SSL.
     '''
     if completed_only and "pruned" in per_sample_val.columns:
         per_sample_val = per_sample_val[~per_sample_val["pruned"].astype(bool)]
     keys = list(by) + [trial_column]
-    extra = [column for column in ("lr", "weight_decay") if column in per_sample_val.columns]
+    wanted = ("lr", "weight_decay") if extra_columns is None else tuple(extra_columns)
+    extra = [column for column in wanted if column in per_sample_val.columns]
     seed = ["seed"] if "seed" in per_sample_val.columns else []
     per_patient = aggregate_per_patient(per_sample_val, group_columns=keys + extra + seed)
     per_trial = (

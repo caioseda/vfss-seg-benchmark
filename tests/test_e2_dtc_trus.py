@@ -17,6 +17,7 @@ import torch.nn.functional as F
 from omegaconf import OmegaConf
 
 from src.models.ssl import DTCTRUSLitWrapper, SupervisedLitWrapper
+from src.models.ssl import dtc_trus
 from src.models.ssl.dtc_trus import adaptive_threshold, masked_avg_pool, resize_flow
 from tests.helpers import OPTIMIZER_CFG, TINY_FEATURE_MODEL_CFG, TINY_MODEL_CFG, make_batch
 
@@ -90,6 +91,14 @@ class DTCTRUSTeacherTests(unittest.TestCase):
         other = {"target": TINY_FEATURE_MODEL_CFG["target"], "params": {**TINY_FEATURE_MODEL_CFG["params"], "hidden": 4}}
         with self.assertRaisesRegex(ValueError, "model_cfg"):
             build(save_teacher(self.tmp, model_cfg=other, seed=7))
+
+    def test_init_only_keys_do_not_count_as_a_different_architecture(self):
+        '''Recarregar para avaliação zera `encoder_weights` (sem download); o professor tem de continuar aceito.'''
+        recorded = {"target": "x.Model", "params": {"arch": "A", "encoder_weights": "imagenet", "pretrain_ckpt": "p"}}
+        reloaded = {"target": "x.Model", "params": {"arch": "A", "encoder_weights": None, "pretrain_ckpt": None}}
+        self.assertEqual(dtc_trus._architecture(recorded), dtc_trus._architecture(reloaded))
+        self.assertNotEqual(dtc_trus._architecture(recorded),
+                            dtc_trus._architecture({"target": "x.Model", "params": {"arch": "B"}}))
 
     def test_prototype_needs_forward_features(self):
         tiny_2c = {"target": TINY_MODEL_CFG["target"], "params": {**TINY_MODEL_CFG["params"], "n_classes": 2}}
@@ -265,7 +274,7 @@ class DTCTRUSSweepTests(unittest.TestCase):
     def test_cv_fold_k_gets_the_teacher_of_fold_k(self):
         sweep = self.sweep("e2-cv")
         cells = sweep.plan.cells()
-        self.assertEqual(len(cells), 35)
+        self.assertEqual(len(cells), 50)
         self.write_state(sweep, {f"deeplabv3plus-supervised-global-f{k}-s42": "done" for k in range(5)})
         for cell in cells:
             if cell["method"] != "dtc-trus":

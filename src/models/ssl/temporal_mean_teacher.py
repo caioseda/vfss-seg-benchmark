@@ -35,6 +35,7 @@ from torch import Tensor
 
 from .base import sigmoid_rampup
 from .mean_teacher import MeanTeacherLitWrapper
+from .prototype import PrototypeLossMixin
 from ...data.augmentations import gaussian_noise, weak_augment_temporal
 from ...data.optical_flow import WARP_CONVENTIONS, warp
 
@@ -126,23 +127,41 @@ class TemporalMeanTeacherLitWrapper(TemporalAugmentMixin, MeanTeacherLitWrapper)
             return max(self.total_training_steps - self.temporal_warmup, 0.0)
         return self.budget_fraction_steps(self.temporal_rampup_fraction)
 
-    def current_temporal_weight(self) -> float:
-        '''0 durante o warm-up; depois, rampa sigmoide que COMEÇA no fim do warm-up.'''
+    def temporal_ramp(self) -> float:
+        '''Fator em [0,1] do cronograma temporal: 0 durante o warm-up; depois, rampa sigmoide que COMEÇA no fim dele.'''
         warmup = self.temporal_warmup
         if self.global_step < warmup:
             return 0.0
-        return self.temporal_weight * sigmoid_rampup(self.global_step - warmup, self.temporal_rampup)
+        return sigmoid_rampup(self.global_step - warmup, self.temporal_rampup)
+
+    def current_temporal_weight(self) -> float:
+        '''0 durante o warm-up; depois, rampa sigmoide que COMEÇA no fim do warm-up.'''
+        return self.temporal_weight * self.temporal_ramp()
 
     # ------------------------------------------------------------------ losses
 
-    def _teacher_forward(self, centers: Tensor, neighbors: Tensor) -> Tuple[Tensor, Tensor]:
+    def _teacher_pass(self, inputs: Tensor) -> Tuple[Tensor, Optional[Dict[str, Tensor]]]:
+        '''Forward do teacher (sob `no_grad`, entrada já com ruído): `(softmax, aux)`. Gancho: `aux` leva features.'''
+        with torch.no_grad():
+            return torch.softmax(self.teacher(inputs), dim=1), None
+
+    def _teacher_forward(self, centers: Tensor, neighbors: Tensor) -> Tuple[Tensor, Tensor, Optional[Dict[str, Tensor]]]:
         '''Um único forward do teacher sobre (centrais, vizinhos), cada um com o ruído do MT.'''
         inputs = torch.cat([centers, neighbors], dim=0)
         inputs = gaussian_noise(inputs, std=self.noise_std, clamp=self.noise_clamp)
-        with torch.no_grad():
-            soft = torch.softmax(self.teacher(inputs), dim=1)
+        soft, aux = self._teacher_pass(inputs)
         self.count_forward("teacher", inputs.shape[0])
-        return soft[:centers.shape[0]], soft[centers.shape[0]:]
+        return soft[:centers.shape[0]], soft[centers.shape[0]:], aux
+
+    def _student_forward(self, images: Tensor, neighbor_images: Tensor) -> Tuple[Tensor, Optional[Dict[str, Tensor]]]:
+        '''Forward do student: `(logits dos centrais, aux)`. Gancho: o student do MT temporal nunca vê os vizinhos.'''
+        logits = self.forward(images)
+        self.count_forward("student", images.shape[0])
+        return logits, None
+
+    def _extra_pair_loss(self, context: Dict, logs: Dict[str, Tensor]) -> Optional[Tensor]:
+        '''Gancho: termo PONDERADO adicional sobre os pares (central, vizinho); `logs` recebe o que for logado.'''
+        return None
 
     def temporal_loss(self, student_soft: Tensor, transported: Tensor, confidence: Tensor) -> Tensor:
         '''
@@ -163,33 +182,35 @@ class TemporalMeanTeacherLitWrapper(TemporalAugmentMixin, MeanTeacherLitWrapper)
         is_labeled = self.labeled_mask(batch).to(images.device)
         unlabeled = ~is_labeled
 
-        logits = self.forward(images)
-        self.count_forward("student", images.shape[0])
+        mt_weight = self.current_consistency_weight()
+        temporal_weight = self.current_temporal_weight()
+        unsupervised = (mt_weight > 0.0 or temporal_weight > 0.0) and bool(unlabeled.any())
+
+        # Os vizinhos válidos dos centrais não rotulados: só quando o termo temporal está ligado.
+        has_neighbors = all(key in batch for key in NEIGHBOR_KEYS)
+        if unsupervised and has_neighbors and temporal_weight > 0.0:
+            valid = batch["neighbor_valid"][unlabeled].bool()                 # [U,K]
+            neighbor_images = batch["neighbors"][unlabeled][valid]             # [N,C,H,W]
+        else:
+            valid = torch.zeros((int(unlabeled.sum()), 0), dtype=torch.bool, device=images.device)
+            neighbor_images = images[unlabeled][:0]
+
+        logits, student_aux = self._student_forward(images, neighbor_images)
 
         if is_labeled.any():
             sup_loss = self.supervised_loss(logits[is_labeled], targets[is_labeled])
         else:
             sup_loss = logits.sum() * 0.0
 
-        mt_weight = self.current_consistency_weight()
-        temporal_weight = self.current_temporal_weight()
         zero = logits.sum() * 0.0
-        mt_loss, temp_loss = zero, zero
+        mt_loss, temp_loss, extra_loss = zero, zero, zero
         extra: Dict[str, Tensor] = {}
 
-        has_neighbors = all(key in batch for key in NEIGHBOR_KEYS)
-        if (mt_weight > 0.0 or temporal_weight > 0.0) and unlabeled.any():
+        if unsupervised:
             centers = images[unlabeled]
             student_soft = torch.softmax(logits[unlabeled], dim=1)
 
-            if has_neighbors and temporal_weight > 0.0:
-                valid = batch["neighbor_valid"][unlabeled].bool()                 # [U,K]
-                neighbor_images = batch["neighbors"][unlabeled][valid]             # [N,C,H,W]
-            else:
-                valid = torch.zeros((centers.shape[0], 0), dtype=torch.bool, device=images.device)
-                neighbor_images = centers[:0]
-
-            teacher_center, teacher_neighbors = self._teacher_forward(centers, neighbor_images)
+            teacher_center, teacher_neighbors, teacher_aux = self._teacher_forward(centers, neighbor_images)
 
             hidden, has_hidden = self.hidden_targets(batch, unlabeled)
             self.log_unlabeled_diagnostics(teacher_center.argmax(dim=1), hidden, has_hidden,
@@ -211,10 +232,19 @@ class TemporalMeanTeacherLitWrapper(TemporalAugmentMixin, MeanTeacherLitWrapper)
                     self.log_unlabeled_diagnostics(transported.argmax(dim=1), hidden[center_of_pair],
                                                    has_hidden[center_of_pair], prefix="train/transported")
                 extra["train/noc_mean"] = confidence.mean().detach()
+
+                weighted = self._extra_pair_loss({
+                    "unlabeled": unlabeled, "center_of_pair": center_of_pair, "flow": flow,
+                    "student_soft": student_soft, "student_aux": student_aux,
+                    "teacher_neighbor_soft": teacher_neighbors, "teacher_aux": teacher_aux,
+                    "n_rows": images.shape[0], "n_centers": centers.shape[0],
+                }, extra)
+                if weighted is not None:
+                    extra_loss = weighted
             extra["train/temporal_valid_frac"] = (valid.float().mean() if valid.numel()
                                                   else torch.zeros((), device=images.device))
 
-        loss = sup_loss + mt_weight * mt_loss + temporal_weight * temp_loss
+        loss = sup_loss + mt_weight * mt_loss + temporal_weight * temp_loss + extra_loss
         extra.update({
             "train/mt_loss": mt_loss.detach(),
             "train/temporal_loss": temp_loss.detach(),
@@ -227,3 +257,100 @@ class TemporalMeanTeacherLitWrapper(TemporalAugmentMixin, MeanTeacherLitWrapper)
         self.log("train/temporal_weight_step", temporal_weight, prog_bar=False, logger=True,
                  on_step=True, on_epoch=False)
         return loss
+
+
+PROTO_SOURCES = ("teacher", "student")
+
+
+class PrototypeTemporalMeanTeacherLitWrapper(PrototypeLossMixin, TemporalMeanTeacherLitWrapper):
+    '''
+    MT temporal + L_proto (a perda de protótipos do DTC-TRUS, `src/models/ssl/prototype.py`):
+
+        L = L_sup + lambda_MT(s) * L_MT + lambda_temp(s) * L_temp + lambda_proto(s) * L_proto
+
+    `lambda_proto(s) = proto_weight * (a MESMA rampa do lambda_temp)`: zero até `temporal_warmup` e, depois,
+    sigmoide até o último passo. Os pares (central t, vizinho n) são os mesmos da perda temporal.
+
+    `proto_source` decide de onde vêm o lado do vizinho (probabilidades FG/BG e features):
+
+      - `teacher`: do TEACHER EMA, sem gradiente (o vizinho passa só pelo teacher, como na perda temporal; o
+        student só vê o central). O gradiente da L_proto chega ao student só pelas features do central.
+      - `student`: do STUDENT, com gradiente nos DOIS frames, como no DTC-TRUS. O student faz um único forward
+        de [imagens do lote; vizinhos válidos] (até +U imagens por passo, e a BatchNorm passa a ver os vizinhos
+        junto com os centrais, o que o DTC-TRUS também faz). A perda temporal continua com alvo do teacher.
+
+    O lado do central é sempre o do student. Antes do fim do warm-up (peso zero) o forward é idêntico ao do MT
+    temporal: nada de `forward_features`, nada de vizinhos no student.
+    '''
+
+    def __init__(self, *args, proto_weight: float = 0.1, proto_percentile: float = 0.7,
+                 proto_source: str = "teacher", **kwargs):
+        '''
+        Args:
+            proto_weight: peso máximo de L_proto (0,1 no DTC-TRUS original).
+            proto_percentile: percentil do limiar adaptativo FG/BG.
+            proto_source: `teacher` | `student` (ver acima).
+        '''
+        super().__init__(*args, **kwargs)
+        if proto_source not in PROTO_SOURCES:
+            raise ValueError(f"proto_source deve ser um de {PROTO_SOURCES}, recebeu '{proto_source}'")
+        if not hasattr(self.model, "forward_features"):
+            raise ValueError(
+                f"PrototypeTemporalMeanTeacherLitWrapper exige `forward_features` em {type(self.model).__name__} "
+                "(as arquiteturas smp têm); use `TemporalMeanTeacherLitWrapper` nas demais."
+            )
+        self.save_hyperparameters({
+            "proto_weight": proto_weight,
+            "proto_percentile": proto_percentile,
+            "proto_source": proto_source,
+        })
+        self.proto_weight = proto_weight
+        self.proto_percentile = proto_percentile
+        self.proto_source = proto_source
+
+    def current_proto_weight(self) -> float:
+        return self.proto_weight * self.temporal_ramp()
+
+    # ------------------------------------------------------------------ forwards com features
+
+    def _student_forward(self, images: Tensor, neighbor_images: Tensor) -> Tuple[Tensor, Optional[Dict[str, Tensor]]]:
+        if self.current_proto_weight() <= 0.0:
+            return super()._student_forward(images, neighbor_images)
+        n_rows = images.shape[0]
+        stacked = self.proto_source == "student" and neighbor_images.shape[0] > 0
+        inputs = torch.cat([images, neighbor_images], dim=0) if stacked else images
+        all_logits, local, global_ = self.model.forward_features(inputs)
+        self.count_forward("student", inputs.shape[0])
+        return all_logits[:n_rows], {"logits": all_logits, "local": local, "global": global_}
+
+    def _teacher_pass(self, inputs: Tensor) -> Tuple[Tensor, Optional[Dict[str, Tensor]]]:
+        if self.proto_source != "teacher" or self.current_proto_weight() <= 0.0:
+            return super()._teacher_pass(inputs)
+        with torch.no_grad():
+            logits, local, global_ = self.teacher.forward_features(inputs)
+        return torch.softmax(logits, dim=1), {"local": local, "global": global_}
+
+    # ------------------------------------------------------------------ L_proto
+
+    def _extra_pair_loss(self, context: Dict, logs: Dict[str, Tensor]) -> Optional[Tensor]:
+        weight = self.current_proto_weight()
+        logs["train/proto_weight"] = torch.tensor(weight, device=context["student_soft"].device)
+        if weight <= 0.0 or context["student_aux"] is None:
+            return None
+        pairs, unlabeled, n_rows = context["center_of_pair"], context["unlabeled"], context["n_rows"]
+        student = context["student_aux"]
+        n_centers = context["n_centers"]
+        current_local = student["local"][:n_rows][unlabeled][pairs]
+        current_global = student["global"][:n_rows][unlabeled][pairs]
+        if self.proto_source == "teacher":
+            teacher = context["teacher_aux"]
+            neighbor_probs = context["teacher_neighbor_soft"]
+            neighbor_local, neighbor_global = teacher["local"][n_centers:], teacher["global"][n_centers:]
+        else:
+            neighbor_probs = torch.softmax(student["logits"][n_rows:], dim=1)
+            neighbor_local, neighbor_global = student["local"][n_rows:], student["global"][n_rows:]
+        proto_loss = self.prototype_loss(context["student_soft"][pairs], neighbor_probs, context["flow"],
+                                         current_local, neighbor_local, current_global, neighbor_global)
+        logs["train/proto_loss"] = proto_loss.detach()
+        logs["train/proto_loss_weighted"] = (weight * proto_loss).detach()
+        return weight * proto_loss

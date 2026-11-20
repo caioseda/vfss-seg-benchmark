@@ -21,7 +21,7 @@ from torch import Tensor
 from .base import SemiSupervisedLitWrapper
 from ...data.augmentations import strong_augment, weak_augment
 
-from typing import Dict
+from typing import Dict, Optional
 
 
 class FixMatchLitWrapper(SemiSupervisedLitWrapper):
@@ -29,6 +29,20 @@ class FixMatchLitWrapper(SemiSupervisedLitWrapper):
     # `student_augment` só nos ROTULADOS: os não rotulados já têm as próprias views weak/strong.
     supports_student_augment = True
     student_augment_rows = "labeled"
+
+    @property
+    def main_forward_rows(self) -> str:
+        '''
+        Com `student_augment` ligado, o forward principal (o do termo supervisionado) é SÓ dos rotulados:
+        os logits dos não rotulados nele nunca foram usados (o termo do FixMatch faz os próprios forwards
+        weak/strong), e com rotulados aumentados + não rotulados CRUS no mesmo lote de BN a rede usava o
+        grupo cru como dreno das estatísticas -- em eval, toda imagem INCA crua virava "tudo FG" (E2 de
+        2026-11-17; ver `main_forward_rows` em base.py).
+
+        Sem augmentation (`none`, o X1) as duas metades têm a mesma distribuição, não há dreno, e o
+        comportamento histórico (lote inteiro) é mantido para não mudar runs já publicados.
+        '''
+        return "all" if self.student_augment == "none" else "labeled"
 
     def __init__(self, *args, confidence_threshold: float = 0.95,
                  cutout_prob: float = 0.5, **kwargs):
@@ -46,7 +60,8 @@ class FixMatchLitWrapper(SemiSupervisedLitWrapper):
         self.confidence_threshold = confidence_threshold
         self.cutout_prob = cutout_prob
 
-    def unsupervised_loss(self, batch: Dict, logits: Tensor, is_labeled: Tensor) -> Tensor:
+    def unsupervised_loss(self, batch: Dict, logits: Optional[Tensor], is_labeled: Tensor) -> Tensor:
+        # `logits` (só os rotulados, ou None) não é usado: o termo tem os próprios forwards.
         unlabeled = ~is_labeled
         unlabeled_images = batch["image"][unlabeled]
 

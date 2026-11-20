@@ -441,6 +441,36 @@ def merge_shards(family_dir: str | Path, dry_run: bool = False) -> Dict[str, Any
     return report
 
 
+# ---------------------------------------------------------------------- invalidar celulas
+
+def invalidation_targets(config_path: str | Path, overrides: Optional[List[str]] = None) -> Dict[str, Any]:
+    '''
+    As celulas que `--set` recorta da grade, para `src.sweep_invalidate.invalidate`:
+    `{"family", "run_ids", "run_names": {run_id: run_name}, "cells"}`.
+
+    Exige ao menos uma sobrescrita: invalidar a grade inteira por esquecimento de `--set` jogaria fora
+    todos os metodos que estao certos.
+    '''
+    overrides = _normalize_overrides(overrides)
+    if not overrides:
+        raise ValueError("passe --set para recortar a grade (ex.: \"axes.method=[fixmatch]\"); "
+                         "invalidar a grade inteira nao e permitido por aqui.")
+    sweep = Sweep(config_path, overrides=overrides)
+    cells = sweep.plan.cells()
+    return {
+        "family": sweep.plan.family,
+        "run_ids": [sweep.plan.run_id(cell) for cell in cells],
+        "run_names": {sweep.plan.run_id(cell): sweep.plan.run_name(cell) for cell in cells},
+        "cells": cells,
+    }
+
+
+def archive_label(family: str, label: str) -> str:
+    '''`<familia>-<rotulo>`: o nome do diretorio em `logs/_arquivo/` (ou `<root>/arquivo/` num host).'''
+    label = _valid_tag(label)
+    return label if label.startswith(f"{family}-") else f"{family}-{label}"
+
+
 # ---------------------------------------------------------------------- notebooks
 
 def submit_sweep(config_path: str | Path, session: Optional[str] = None,

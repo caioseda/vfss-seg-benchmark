@@ -21,7 +21,7 @@ axes:
   seed: [42]
   arch: [deeplabv3plus]           # vencedora do E1; qualquer chave de `arch_configs`
   unlabeled_policy: [global]      # [global, same_video] para comparar as duas origens
-  method: [supervised, fixmatch, meanteacher, mt-temporal-prev, mt-temporal-bi, mt-temporal-prev3, dtc-trus]
+  method: [supervised, fixmatch, meanteacher, mt-temporal-prev, mt-temporal-bi, mt-temporal-prev3, mt-temporal-proto-teacher, mt-temporal-proto-student, mt-temporal-nomt, dtc-trus]
 
 base_configs:
   supervised:       configs/experiment/e2/e2-supervised.yaml
@@ -30,6 +30,9 @@ base_configs:
   mt-temporal-prev: configs/experiment/e2/e2-mt-temporal-prev.yaml
   mt-temporal-bi:   configs/experiment/e2/e2-mt-temporal-bi.yaml
   mt-temporal-prev3: configs/experiment/e2/e2-mt-temporal-prev3.yaml   # T=3 (vizinho t-3)
+  mt-temporal-proto-teacher: configs/experiment/e2/e2-mt-temporal-proto-teacher.yaml   # prev + L_proto, vizinho do teacher
+  mt-temporal-proto-student: configs/experiment/e2/e2-mt-temporal-proto-student.yaml   # prev + L_proto, student nos 2 frames
+  mt-temporal-nomt: configs/experiment/e2/e2-mt-temporal-nomt.yaml                     # prev com consistency_weight=0
   dtc-trus:         configs/experiment/e2/e2-dtc-trus.yaml           # etapa 2; etapa 1 = `teacher_from`
 
 # Metodos de duas etapas: a etapa 1 de `dtc-trus` e o best.ckpt da celula `supervised` com as mesmas demais

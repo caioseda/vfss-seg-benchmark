@@ -50,6 +50,8 @@ from omegaconf import DictConfig, OmegaConf
 from torch import Tensor
 
 from .base import SemiSupervisedLitWrapper
+from .prototype import (  # noqa: F401  (reexportados: os testes os importam daqui)
+    PrototypeLossMixin, adaptive_threshold, masked_avg_pool, resize_flow, resize_mask)
 from .temporal_mean_teacher import NEIGHBOR_KEYS, TemporalAugmentMixin
 from ...data.optical_flow import WARP_CONVENTIONS, warp
 from ...utils import instantiate_from_config
@@ -59,16 +61,30 @@ def _plain(value):
     return OmegaConf.to_container(value, resolve=True) if isinstance(value, DictConfig) else value
 
 
+# Chaves do model_cfg que só definem a INICIALIZAÇÃO (pesos pré-treinados), não a arquitetura: o state_dict do
+# professor as sobrescreve, então não entram na comparação (o recarregamento para avaliação as anula).
+INIT_ONLY_MODEL_KEYS = ("encoder_weights", "pretrain_ckpt")
+
+
+def _architecture(model_cfg):
+    cfg = _plain(model_cfg)
+    if isinstance(cfg, dict) and isinstance(cfg.get("params"), dict):
+        cfg = {**cfg, "params": {k: v for k, v in cfg["params"].items() if k not in INIT_ONLY_MODEL_KEYS}}
+    return cfg
+
+
 def load_teacher_state_dict(checkpoint_path: str, expected_model_cfg=None) -> Dict[str, Tensor]:
     '''
     Pesos da REDE de um checkpoint Lightning de um `LitWrapper` (as chaves `model.*`, sem o prefixo).
 
-    Se o checkpoint registrou `model_cfg` nos hiperparâmetros e `expected_model_cfg` for dado, os dois têm de
-    coincidir: um professor de outra arquitetura carregaria (ou falharia) por acidente.
+    Se o checkpoint registrou `model_cfg` nos hiperparâmetros e `expected_model_cfg` for dado, as arquiteturas
+    têm de coincidir: um professor de outra arquitetura carregaria (ou falharia) por acidente. Chaves só de
+    inicialização (`INIT_ONLY_MODEL_KEYS`) são ignoradas.
     '''
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     recorded = (checkpoint.get("hyper_parameters") or {}).get("model_cfg")
-    if expected_model_cfg is not None and recorded is not None and _plain(recorded) != _plain(expected_model_cfg):
+    if (expected_model_cfg is not None and recorded is not None
+            and _architecture(recorded) != _architecture(expected_model_cfg)):
         raise ValueError(
             f"O professor em {checkpoint_path} foi treinado com outro `model_cfg`:\n"
             f"  checkpoint: {_plain(recorded)}\n  esperado:   {_plain(expected_model_cfg)}"
@@ -80,34 +96,7 @@ def load_teacher_state_dict(checkpoint_path: str, expected_model_cfg=None) -> Di
     return state
 
 
-def adaptive_threshold(fg_prob: Tensor, percentile: float = 0.7) -> float:
-    '''Por amostra, o valor de ordem `int(n * percentile)` das probabilidades ordenadas; média do lote.'''
-    flat = fg_prob.detach().flatten(1)
-    index = min(int(flat.shape[1] * percentile), flat.shape[1] - 1)
-    return float(flat.sort(dim=1).values[:, index].mean().item())
-
-
-def masked_avg_pool(features: Tensor, mask: Tensor, eps: float = 1e-6) -> Tensor:
-    '''`[N,C,h,w]` x `[N,1,h,w]` -> `[N,C]`; máscara vazia dá o vetor zero (como no original).'''
-    return (features * mask).sum(dim=(2, 3)) / mask.sum(dim=(2, 3)).clamp_min(eps)
-
-
-def resize_flow(flow: Tensor, size: Tuple[int, int]) -> Tensor:
-    '''Fluxo em pixels `[N,2,H,W]` levado a `size`, com os vetores escalados (convenção `align_corners`).'''
-    height, width = flow.shape[-2:]
-    if (height, width) == tuple(size):
-        return flow
-    resized = F.interpolate(flow, size=size, mode="bilinear", align_corners=True)
-    scale_x = (size[1] - 1) / max(width - 1, 1)
-    scale_y = (size[0] - 1) / max(height - 1, 1)
-    return torch.stack((resized[:, 0] * scale_x, resized[:, 1] * scale_y), dim=1)
-
-
-def resize_mask(mask: Tensor, size: Tuple[int, int]) -> Tensor:
-    return mask if mask.shape[-2:] == tuple(size) else F.interpolate(mask, size=size, mode="nearest")
-
-
-class DTCTRUSLitWrapper(TemporalAugmentMixin, SemiSupervisedLitWrapper):
+class DTCTRUSLitWrapper(PrototypeLossMixin, TemporalAugmentMixin, SemiSupervisedLitWrapper):
 
     # `student_augment` vale para o lote inteiro (não há linhas "rotuladas" para o método) e leva a mesma
     # geometria aos vizinhos, ao fluxo e ao M_noc (`TemporalAugmentMixin`).
@@ -207,36 +196,6 @@ class DTCTRUSLitWrapper(TemporalAugmentMixin, SemiSupervisedLitWrapper):
         '''`1 - mean(M_noc * (1 - |P_t - W(P_n)|))`, média sobre pares e pixels (não normalizada por M_noc).'''
         diff = (current - transported).abs().mean(dim=1, keepdim=True)
         return 1.0 - (confidence * (1.0 - diff)).mean()
-
-    def prototype_loss(self, current_probs: Tensor, neighbor_probs: Tensor, flow: Tensor,
-                       current_local: Tensor, neighbor_local: Tensor,
-                       current_global: Tensor, neighbor_global: Tensor) -> Tensor:
-        '''L_proto de um lote de pares (n -> t), como no original (ver docstring do módulo).'''
-        current_fg_prob = 1.0 - current_probs[:, :1]
-        neighbor_fg_prob = 1.0 - neighbor_probs[:, :1]
-        threshold = adaptive_threshold(current_fg_prob, self.proto_percentile)
-
-        current_fg = (current_fg_prob > threshold).float()
-        neighbor_fg = (neighbor_fg_prob > threshold).float()
-        warped_neighbor_fg = (warp(neighbor_fg_prob, flow, self.warp_convention) > threshold).float()
-
-        # Local: features do vizinho transportadas para t; FG na interseção.
-        local_size = tuple(current_local.shape[-2:])
-        warped_local = warp(neighbor_local, resize_flow(flow, local_size), self.warp_convention)
-        fg_mask = resize_mask(current_fg * warped_neighbor_fg, local_size)
-        local = 1.0 - F.cosine_similarity(masked_avg_pool(warped_local, fg_mask),
-                                          masked_avg_pool(current_local, fg_mask), dim=-1)
-
-        # Global: gargalo, BG de cada frame no próprio referencial (sem fluxo).
-        global_size = tuple(current_global.shape[-2:])
-        global_ = 1.0 - F.cosine_similarity(
-            masked_avg_pool(neighbor_global, resize_mask(1.0 - neighbor_fg, global_size)),
-            masked_avg_pool(current_global, resize_mask(1.0 - current_fg, global_size)), dim=-1)
-
-        w_fg = current_fg_prob.mean(dim=(1, 2, 3)).mean().detach()
-        w_bg = 1.0 - w_fg
-        # Pesos cruzados como no original: o termo FG (local) pela fração BG, o BG (global) pela FG.
-        return w_bg * local.mean() + w_fg * global_.mean()
 
     # ------------------------------------------------------------------ training
 

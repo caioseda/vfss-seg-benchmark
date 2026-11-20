@@ -296,7 +296,7 @@ class E2SweepTests(unittest.TestCase):
         cells = plan.cells()
         self.assertEqual([c["method"] for c in cells],
                          ["supervised", "fixmatch", "meanteacher", "mt-temporal-prev", "mt-temporal-bi", "mt-temporal-prev3",
-                          "dtc-trus"])
+                          "mt-temporal-proto-teacher", "mt-temporal-proto-student", "mt-temporal-nomt", "dtc-trus"])
         overrides = plan.overrides(cells[0])
         frozen = plan.frozen_hparams["deeplabv3plus"]
         self.assertEqual(overrides["optimizer"]["params"]["lr"], frozen["lr"])
@@ -332,6 +332,15 @@ class E2TemporalT3Tests(unittest.TestCase):
         prev3["name"] = prev["name"]
         self.assertEqual(prev3, prev)
 
+    def test_nomt_differs_from_prev_only_in_name_and_consistency_weight(self):
+        load = lambda name: OmegaConf.to_container(OmegaConf.load(str(PROJECT_ROOT / f"configs/experiment/e2/{name}.yaml")))
+        prev, nomt = load("e2-mt-temporal-prev"), load("e2-mt-temporal-nomt")
+        self.assertEqual(nomt["lit_module"]["params"]["consistency_weight"], 0.0)
+        self.assertEqual(nomt["data"]["params"]["train"]["params"]["neighbor_offsets"], [-1])
+        nomt["lit_module"]["params"]["consistency_weight"] = prev["lit_module"]["params"]["consistency_weight"]
+        nomt["name"] = prev["name"]
+        self.assertEqual(nomt, prev)
+
     def test_neighbor_is_the_frame_three_steps_back(self):
         ds = VFSSTemporalNeighborsDataset.__new__(VFSSTemporalNeighborsDataset)
         ds.neighbor_offsets, ds.neighbor_gap = [-1], 3
@@ -350,13 +359,13 @@ class E2CVSweepTests(unittest.TestCase):
 
     def test_grid_is_folds_by_methods_with_method_innermost(self):
         cells = self.sweep.plan.cells()
-        self.assertEqual(len(cells), 35)
-        self.assertEqual([c["fold"] for c in cells[:7]], [0] * 7)
-        self.assertEqual([c["method"] for c in cells[:7]],
+        self.assertEqual(len(cells), 50)
+        self.assertEqual([c["fold"] for c in cells[:10]], [0] * 10)
+        self.assertEqual([c["method"] for c in cells[:10]],
                          ["supervised", "fixmatch", "meanteacher", "mt-temporal-prev", "mt-temporal-bi", "mt-temporal-prev3",
-                          "dtc-trus"])
+                          "mt-temporal-proto-teacher", "mt-temporal-proto-student", "mt-temporal-nomt", "dtc-trus"])
         run_ids = [self.sweep.plan.run_id(c) for c in cells]
-        self.assertEqual(len(set(run_ids)), 35)
+        self.assertEqual(len(set(run_ids)), 50)
         self.assertEqual(run_ids[0], "deeplabv3plus-supervised-global-f0-s42")
 
     def write_supervised_state(self):
